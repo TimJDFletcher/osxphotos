@@ -77,7 +77,6 @@ logger = logging.getLogger("osxphotos")
 
 __all__ = ["PhotosDB", "PhotosDBReadError"]
 
-
 # TODO: Add test for imageTimeZoneOffsetSeconds = None
 # TODO: Add test for __str__
 # TODO: Add special albums and magic albums
