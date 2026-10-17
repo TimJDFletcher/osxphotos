@@ -164,6 +164,10 @@ RAF = RawType("raf", RAF_UTI, "raf")
 # ZINTERNALRESOURCE.ZCOMPACTUTI for a Fuji RAF, as in the owner's library
 # (9,311 RAW resources, whose RAW originals have UTI com.fuji.raw-image)
 RAF_COMPACT_UTI = 21
+# Pumkins2.jpg, made a RAF-only original in the RAF copies (no JPEG pair): the
+# owner's library has one named DSCF5273.RAF, on the share as DSCF5273.RAF
+UUID_RAF_ONLY = "D79B8D77-BFFC-460B-9312-034F2877D35B"
+RAF_ONLY_FILENAME = "DSCF5273.RAF"
 
 
 def _make_raf_library(library: str, dest: pathlib.Path) -> pathlib.Path:
@@ -196,12 +200,44 @@ def _make_raf_library(library: str, dest: pathlib.Path) -> pathlib.Path:
             uuids,
         )
         assert cur.rowcount == 1  # IMG_2000, a referenced file
+        _make_raf_only_original(conn)
         conn.commit()
     finally:
         conn.close()
     (raw_cr2,) = (copy / "originals").glob(f"*/{UUID_RAW_PAIR}_4.cr2")
     raw_cr2.rename(raw_cr2.with_suffix(".raf"))
+    # the RAF-only original is evicted: its file isn't in originals/
+    (copy / "originals" / "D" / f"{UUID_RAF_ONLY}.jpeg").unlink()
     return copy
+
+
+def _make_raf_only_original(conn):
+    """Turn Pumkins2.jpg into an evicted RAF-only original, DSCF5273.RAF
+
+    Shaped on the owner's 3FFD68E9-...: asset UTI com.fuji.raw-image, compact
+    UTI 21 on the original resource, not available locally.
+    """
+    (asset_pk,) = conn.execute(
+        "SELECT Z_PK FROM ZASSET WHERE ZUUID = ?", (UUID_RAF_ONLY,)
+    ).fetchone()
+    conn.execute(
+        "UPDATE ZASSET SET ZUNIFORMTYPEIDENTIFIER = ?, ZFILENAME = ? WHERE Z_PK = ?",
+        (RAF_UTI, f"{UUID_RAF_ONLY}.raf", asset_pk),
+    )
+    conn.execute(
+        "UPDATE ZADDITIONALASSETATTRIBUTES SET ZORIGINALFILENAME = ? WHERE ZASSET = ?",
+        (RAF_ONLY_FILENAME, asset_pk),
+    )
+    cur = conn.execute(
+        """ UPDATE ZINTERNALRESOURCE SET ZCOMPACTUTI = ?, ZDATALENGTH = ?
+        WHERE ZASSET = ? AND ZRESOURCETYPE = 0 AND ZDATASTORESUBTYPE = 1""",
+        (RAF_COMPACT_UTI, 33790976, asset_pk),
+    )
+    assert cur.rowcount == 1
+    conn.execute(
+        "UPDATE ZINTERNALRESOURCE SET ZLOCALAVAILABILITY = -1 WHERE ZASSET = ?",
+        (asset_pk,),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -370,9 +406,7 @@ def test_raw_pair_changed_downloads(exported_pair, monkeypatch, changed):
 
 
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
-def test_missing_raw_recorded_with_real_extension(
-    exported_pair, raw_type, monkeypatch
-):
+def test_missing_raw_recorded_with_real_extension(exported_pair, raw_type, monkeypatch):
     """A RAW that needs updating but doesn't download is reported missing
     under its real extension (.cr2 or .raf), not .raw"""
     photo, dest_dir, stem, raw_name = exported_pair
@@ -428,6 +462,39 @@ def test_raf_pair_exported_and_checked_under_lower_case_raf(
     results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
     assert download.calls == []
     assert sorted(results.skipped) == [str(dest_dir / name) for name in names]
+
+
+@pytest.mark.parametrize("library", RAW_PAIR_LIBRARIES)
+def test_raf_only_original_checked_under_its_upper_case_name(
+    raf_libraries, monkeypatch, tmp_path, library
+):
+    """An evicted RAF-only original is exported under its original name,
+    DSCF5273.RAF (upper case, unlike a pair's .raf), and once up to date the
+    check finds that exact name and skips it without a download"""
+    library = raf_libraries(library)
+    photo = osxphotos.PhotosDB(dbfile=str(library)).get_photo(UUID_RAF_ONLY)
+    assert photo.ismissing and photo.path is None
+    assert not photo.has_raw
+    assert photo.original_filename == RAF_ONLY_FILENAME
+    assert photo.uti == photo.uti_original == RAF_UTI
+
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    raf_bytes = tmp_path / "raf_bytes"
+    raf_bytes.write_bytes(b"FUJIFILMCCD-RAW ")
+    download = FakeDownload(staging, {"original": (raf_bytes, RAF_ONLY_FILENAME)})
+    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert len(download.calls) == 1
+    assert [path.name for path in dest_dir.iterdir()] == [RAF_ONLY_FILENAME]
+    assert first.new == [str(dest_dir / RAF_ONLY_FILENAME)]
+
+    download = FakeDownload()
+    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert download.calls == []
+    assert results.skipped == [str(dest_dir / RAF_ONLY_FILENAME)]
+    assert results.new == results.updated == results.missing == []
 
 
 @pytest.mark.parametrize(
