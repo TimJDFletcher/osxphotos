@@ -4,18 +4,22 @@ used by export --update --download-missing (#1086)
 These run at the PhotoExporter level. _stage_missing_photos_for_export_helper,
 the one place a download through AppleScript or PhotoKit would start, is
 monkeypatched to record its calls, so nothing is downloaded and Photos is
-never touched.
+never touched. The --cleanup tests at the end go through the CLI, where
+cleanup lives, with the same helper patched.
 """
 
 from __future__ import annotations
 
+import json
 import pathlib
 import shutil
 import sqlite3
 
 import pytest
+from click.testing import CliRunner
 
 import osxphotos
+from osxphotos.cli.export import export as cli_export
 from osxphotos.exportoptions import ExportOptions
 from osxphotos.photoexporter import PhotoExporter, StagedFiles
 from osxphotos.photoinfo import PhotoInfo
@@ -527,3 +531,107 @@ def test_library_compact_uti_codes_match_table(library):
     assert codes
     for code, uti in codes.items():
         assert COMPACT_UTI_CODES.get(code, uti) == uti
+
+
+# --cleanup after an evicted RAW+JPEG pair (#11). Cleanup lives in the CLI: it
+# keeps the files listed as exported, skipped or missing and deletes the rest.
+# While uti_raw was None the RAW was listed under a guessed <stem>.raw, so the
+# real <stem>.raf or .CR2 on the destination was deleted, as DSCF9187.raf was
+# on the owner's share. These run the CLI as the backup does.
+
+
+def _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download):
+    """Run export --update --download-missing --cleanup --exportdb <db> on one
+    photo, as a separate run; return the --report records keyed by lower-case
+    file name"""
+    monkeypatch.setattr(
+        PhotoExporter,
+        "_stage_missing_photos_for_export_helper",
+        lambda self, options: download(self, options),
+    )
+    report = dest_dir.parent / "report.json"
+    result = CliRunner().invoke(
+        cli_export,
+        [
+            "--library",
+            str(library),
+            "--uuid",
+            uuid,
+            "--update",
+            "--download-missing",
+            "--cleanup",
+            "--exportdb",
+            str(dest_dir.parent / "export.db"),
+            "--report",
+            str(report),
+            "-V",
+            str(dest_dir),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return {
+        pathlib.Path(record["filename"]).name.lower(): record
+        for record in json.loads(report.read_text())
+    }
+
+
+@pytest.fixture
+def cli_exported_pair(raw_photosdb, raw_type, evicted_pair, monkeypatch, tmp_path, request):
+    """Export an evicted RAW+JPEG pair once through the CLI, downloading
+    <stem>.JPG and the RAW (<stem>.CR2 or <stem>.raf; IMG_1994's content)
+
+    Returns the library, uuid, export directory, stem and the RAW's name.
+    """
+    uuid, stem = request.param
+    library = raw_photosdb.library_path
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    jpeg, raw = evicted_pair
+    raw_name = f"{stem}.{raw_type.staged_ext}"
+    download = FakeDownload(
+        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, raw_name)}
+    )
+    _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
+    assert len(download.calls) == 1
+    assert sorted(path.name for path in dest_dir.iterdir()) == sorted(
+        [f"{stem}.JPG", raw_name]
+    )
+    return library, uuid, dest_dir, stem, raw_name
+
+
+@pytest.mark.parametrize("cli_exported_pair", RAW_PAIRS, indirect=True)
+def test_cleanup_keeps_up_to_date_evicted_raw_pair(cli_exported_pair, monkeypatch):
+    """--cleanup keeps both files of an evicted RAW+JPEG pair that is up to
+    date: the pair is skipped, with no download"""
+    library, uuid, dest_dir, stem, raw_name = cli_exported_pair
+    before = {path.name: path.read_bytes() for path in dest_dir.iterdir()}
+    download = FakeDownload()
+    records = _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
+    assert {path.name: path.read_bytes() for path in dest_dir.iterdir()} == before
+    assert not any(r["cleanup_deleted_file"] for r in records.values())
+    assert download.calls == []
+    assert records[f"{stem}.jpg".lower()]["skipped"]
+    assert records[raw_name.lower()]["skipped"]
+
+
+@pytest.mark.parametrize("changed", ["JPG", "RAW"])
+@pytest.mark.parametrize("cli_exported_pair", RAW_PAIRS, indirect=True)
+def test_cleanup_keeps_raw_of_evicted_pair_recorded_missing(
+    cli_exported_pair, raw_type, monkeypatch, changed
+):
+    """--cleanup keeps the RAW of an evicted pair whose download returns
+    nothing: the pair is recorded missing under the RAW's real extension
+    (.cr2 or .raf), so the file already on the destination is kept"""
+    library, uuid, dest_dir, stem, raw_name = cli_exported_pair
+    changed_name = f"{stem}.JPG" if changed == "JPG" else raw_name
+    (dest_dir / changed_name).write_bytes(b"changed")
+    before = {path.name: path.read_bytes() for path in dest_dir.iterdir()}
+    download = FakeDownload()
+    records = _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
+    assert {path.name: path.read_bytes() for path in dest_dir.iterdir()} == before
+    assert not any(r["cleanup_deleted_file"] for r in records.values())
+    assert len(download.calls) == 1
+    missing = sorted(name for name, r in records.items() if r["missing"])
+    assert missing == _lower([f"{stem}.jpg", f"{stem}.{raw_type.name}"])
