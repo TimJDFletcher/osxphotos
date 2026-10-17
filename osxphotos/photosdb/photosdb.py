@@ -64,7 +64,6 @@ from ..uti import get_uti_for_extension
 from ..utils import _check_file_exists, get_last_library_path, noop
 from .photosdb_utils import (
     get_db_version,
-    get_library_compact_uti_codes,
     get_model_version,
     get_photos_version_from_model,
     uti_for_compact_uti,
@@ -2609,7 +2608,7 @@ class PhotosDB:
                 self._dbphotos[uuid]["raw_relative_path"] = row[2]
 
         if self._photos_ver >= 7:
-            self._set_raw_utis_from_compact_uti(c, asset_table)
+            self._set_raw_utis_from_compact_uti()
 
         # add faces and keywords to photo data
         for uuid in self._dbphotos:
@@ -2692,27 +2691,19 @@ class PhotosDB:
 
         verbose("Done processing details from Photos library.")
 
-    def _set_raw_utis_from_compact_uti(self, cursor, asset_table: str):
-        """Replace the ZCOMPACTUTI code that the Photos 7+ RAW query read into
-        each photo's UTI_raw with the RAW's UTI, or None if the code can't be
+    def _set_raw_utis_from_compact_uti(self):
+        """Replace the ZCOMPACTUTI value that the Photos 7+ RAW query read into
+        each photo's UTI_raw with the RAW's UTI, or None if it can't be
         resolved to a RAW type
 
-        A code is resolved from, in order:
+        A value is resolved from, in order:
 
-        1. COMPACT_UTI_CODES. These codes have been the same in every library
-           seen (Photos 8 to 11): 1 jpeg, 3 heic, 6 png, 9 dng, 11 cr2, 21 raf.
-           The table comes first because the library-derived guesses below
-           are only as good as the library's own records.
-        2. The library's original resources (get_library_compact_uti_codes),
-           which include any RAW-only originals of that type.
-        3. The library's RAWs with that code whose file is on disk: the UTI for
-           the file's extension. In a RAW+JPEG pair the original is the JPEG,
-           so this is what resolves an evicted pair's RAW when the library has
-           another pair of that type with its RAW on disk.
-
-        Args:
-            cursor: sqlite3 cursor on the library's Photos.sqlite
-            asset_table: name of the asset table, e.g. ZASSET
+        1. COMPACT_UTI_CODES, Apple's table of codes (see photosdb_utils).
+        2. "_" + UTI, which Photos stores for a type without a code.
+        3. For a code not in the table, such as one a later Photos adds, the
+           library's RAWs with that code whose file is on disk: the UTI for the
+           file's extension. So one local RAW of a new type resolves the
+           evicted RAWs of that type.
         """
         unresolved = []
         for uuid, info in self._dbphotos.items():
@@ -2726,15 +2717,8 @@ class PhotosDB:
         if not unresolved:
             return
 
-        library_codes = get_library_compact_uti_codes(cursor, asset_table)
-        still_unresolved = []
-        for uuid, info, code in unresolved:
-            info["UTI_raw"] = uti_if_raw(library_codes.get(code))
-            if info["UTI_raw"] is None:
-                still_unresolved.append((uuid, info, code))
-
         counts = Counter()
-        for uuid, info, code in still_unresolved:
+        for uuid, info, code in unresolved:
             if path_raw := PhotoInfo(db=self, uuid=uuid, info=info).path_raw:
                 if uti := uti_if_raw(
                     get_uti_for_extension(pathlib.Path(path_raw).suffix)
@@ -2742,7 +2726,7 @@ class PhotosDB:
                     counts[code, uti] += 1
         # least common first, so the most common UTI for each code wins
         local_codes = {code: uti for (code, uti), _ in reversed(counts.most_common())}
-        for _, info, code in still_unresolved:
+        for _, info, code in unresolved:
             info["UTI_raw"] = local_codes.get(code)
 
     def _process_moments(self):

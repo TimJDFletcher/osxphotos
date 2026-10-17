@@ -30,11 +30,8 @@ from osxphotos.cli.export import export as cli_export
 from osxphotos.exportoptions import ExportOptions
 from osxphotos.photoexporter import PhotoExporter, StagedFiles
 from osxphotos.photoinfo import PhotoInfo
-from osxphotos.photosdb.photosdb_utils import (
-    COMPACT_UTI_CODES,
-    get_library_compact_uti_codes,
-    uti_for_compact_uti,
-)
+from osxphotos.photosdb.photosdb_utils import uti_for_compact_uti
+from osxphotos.uti import get_uti_for_extension
 
 
 class FakeDownload:
@@ -431,10 +428,17 @@ def test_raf_only_original_checked_under_its_upper_case_name(
 @pytest.mark.parametrize(
     "compact_uti,uti",
     [
+        ("1", "public.jpeg"),
+        ("9", "com.adobe.raw-image"),
+        ("10", "com.sony.arw-raw-image"),
         ("11", CR2_UTI),
         (11, CR2_UTI),
         ("21", RAF_UTI),
+        ("36", "public.data"),
+        ("37", "com.apple.photos.apple-adjustment-envelope"),
+        ("39", "public.jpeg-xl"),
         ("_org.webmproject.webp", "org.webmproject.webp"),
+        ("2", None),
         ("99", None),
         (None, None),
     ],
@@ -444,23 +448,88 @@ def test_uti_for_compact_uti(compact_uti, uti):
     assert uti_for_compact_uti(compact_uti) == uti
 
 
-@pytest.mark.parametrize("library", RAW_PAIR_LIBRARIES)
-def test_library_compact_uti_codes_match_table(library):
-    """The codes the test libraries use for their originals agree with the table"""
+def _photos_7_libraries():
+    """The test libraries whose resources have a ZCOMPACTUTI (Photos 7+)"""
+    libraries = []
+    for library in sorted(pathlib.Path("./tests").glob("*.photoslibrary")):
+        db = library / "database" / "Photos.sqlite"
+        if not db.is_file():
+            continue
+        conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+        try:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(ZINTERNALRESOURCE)")
+            ]
+        finally:
+            conn.close()
+        if "ZCOMPACTUTI" in columns:
+            libraries.append(str(library))
+    return libraries
+
+
+PHOTOS_7_LIBRARIES = _photos_7_libraries()
+# ZDATASTORESUBTYPE of a resource, and the PhotoInfo property for its file
+RESOURCE_PATHS = {1: "path", 17: "path_raw", 18: "path_live_photo"}
+
+
+# Libraries with a RAW+JPEG pair whose RAW is on disk
+LIBRARIES_WITH_RAW_ON_DISK = [
+    pathlib.Path(library).name
+    for library in RAW_PAIR_LIBRARIES
+    + [
+        "./tests/Test-16.0.0-beta.photoslibrary",
+        "./tests/Test-27.0_DevBeta.photoslibrary",
+    ]
+]
+
+
+def test_photos_7_libraries_include_libraries_with_raw_on_disk():
+    names = [pathlib.Path(library).name for library in PHOTOS_7_LIBRARIES]
+    assert set(LIBRARIES_WITH_RAW_ON_DISK) <= set(names)
+
+
+@pytest.mark.parametrize(
+    "library", PHOTOS_7_LIBRARIES, ids=lambda library: pathlib.Path(library).stem
+)
+def test_library_compact_uti_codes_match_table(library, tmp_path):
+    """The code of each original, RAW and Live Photo video whose file is on
+    disk in the test library resolves to the UTI for the file's extension"""
     db = pathlib.Path(library) / "database" / "Photos.sqlite"
+    # read a copy of the database, so the library's -shm files are left alone
+    db_copy = tmp_path / "Photos.sqlite"
+    for db_file in db.parent.glob("Photos.sqlite*"):
+        shutil.copy(db_file, tmp_path / db_file.name)
     conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
     try:
-        codes = get_library_compact_uti_codes(conn.cursor(), "ZASSET")
+        rows = conn.execute(
+            f""" SELECT ZASSET.ZUUID, ZINTERNALRESOURCE.ZDATASTORESUBTYPE,
+            ZINTERNALRESOURCE.ZCOMPACTUTI
+            FROM ZINTERNALRESOURCE
+            JOIN ZASSET ON ZASSET.Z_PK = ZINTERNALRESOURCE.ZASSET
+            WHERE ZINTERNALRESOURCE.ZDATASTORESUBTYPE IN
+            ({", ".join(str(subtype) for subtype in RESOURCE_PATHS)})"""
+        ).fetchall()
     finally:
         conn.close()
-    assert codes
-    for code, uti in codes.items():
-        assert COMPACT_UTI_CODES.get(code, uti) == uti
+    photosdb = osxphotos.PhotosDB(
+        dbfile=str(db_copy), library_path=library, _skip_searchinfo=True
+    )
+    checked = []
+    for uuid, subtype, code in rows:
+        photo = photosdb.get_photo(uuid)
+        path = getattr(photo, RESOURCE_PATHS[subtype]) if photo else None
+        if not path:
+            continue
+        uti = get_uti_for_extension(pathlib.Path(path).suffix)
+        checked.append((uuid, subtype, code, uti_for_compact_uti(code), uti))
+    assert [c for c in checked if c[3] != c[4]] == []
+    if pathlib.Path(library).name in LIBRARIES_WITH_RAW_ON_DISK:
+        assert any(subtype == 17 for _, subtype, *_ in checked)
 
 
-# A RAW's compact UTI code that isn't in COMPACT_UTI_CODES is learned from the
-# library: from original resources with that code, or from RAWs with that code
-# whose file is on disk. ARW_COMPACT_UTI stands for a code the table doesn't have.
+# A RAW's compact UTI code that isn't in COMPACT_UTI_CODES, such as one a later
+# Photos adds, is learned from the library's RAWs with that code whose file is
+# on disk. ARW_COMPACT_UTI stands for a code the table doesn't have.
 ARW_COMPACT_UTI = 99
 ARW_UTI = "com.sony.arw-raw-image"
 FALLBACK_LIBRARY = "./tests/Test-26.1.photoslibrary"
@@ -508,8 +577,8 @@ def test_unknown_raw_code_learned_from_raw_on_disk(tmp_path):
 
 
 def test_unknown_raw_code_without_a_source_stays_unknown(tmp_path, download):
-    """With no RAW on disk or original with the same code, an unknown code
-    leaves uti_raw None, and the RAW is still recorded missing as .raw"""
+    """With no RAW on disk with the same code, an unknown code leaves
+    uti_raw None, and the RAW is still recorded missing as .raw"""
     library = _make_library_with_raw_code(
         tmp_path, [UUID_MISSING_PAIR], ARW_COMPACT_UTI
     )

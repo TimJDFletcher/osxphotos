@@ -217,18 +217,53 @@ def get_db_path_for_library(photos_library: str | pathlib.Path) -> pathlib.Path:
     return photos_library
 
 
-# ZINTERNALRESOURCE.ZCOMPACTUTI codes in Photos 7+ libraries, seen in Photos 8 to 11.
-# A type with no code is stored as "_" followed by its UTI, e.g. "_org.webmproject.webp".
+# ZINTERNALRESOURCE.ZCOMPACTUTI (Photos 7+, macOS 12+) holds Apple's PLUniformFileType
+# codes, from PhotoLibraryServices.framework:
+# +[PLUniformTypeIdentifierIntegratedLookup compactRepresentationForIdentifier:] /
+# identifierFromCompactRepresentation:, via PLFileTypeFromIdentifier /
+# PLUTTypeFromUniformFileType (table built in populateExtensionFileTypeMappings; read
+# from the macOS 27 dyld shared cache). A UTI without a code is stored as "_" + UTI.
+# Codes agree with test libraries from macOS 12 to 27. Codes 9 to 22 are the RAW
+# types (PLUniformFileTypeIsRawImage); code 2 is unassigned.
 COMPACT_UTI_CODES = {
     "1": "public.jpeg",
     "3": "public.heic",
+    "4": "public.heif",
+    "5": "public.avci",
     "6": "public.png",
+    "7": "com.compuserve.gif",
     "8": "public.tiff",
     "9": "com.adobe.raw-image",
+    "10": "com.sony.arw-raw-image",
     "11": "com.canon.cr2-raw-image",
+    "12": "com.canon.crw-raw-image",
+    "13": "com.olympus.raw-image",
+    "14": "com.panasonic.rw2-raw-image",
+    "15": "com.panasonic.raw-image",
+    "16": "com.pentax.raw-image",
+    "17": "com.nikon.raw-image",
+    "18": "com.samsung.raw-image",
+    "19": "com.leafamerica.raw-image",
+    "20": "com.hasselblad.3fr-raw-image",
     "21": "com.fuji.raw-image",
+    "22": "com.hasselblad.fff-raw-image",
     "23": "com.apple.quicktime-movie",
     "24": "public.mpeg-4",
+    "25": "com.apple.m4v-video",
+    "26": "public.3gpp",
+    "27": "public.avi",
+    "28": "com.apple.m4a-audio",
+    "29": "com.apple.coreaudio-format",
+    "30": "com.microsoft.waveform-audio",
+    "31": "public.aifc-audio",
+    "32": "public.aiff-audio",
+    "33": "public.mp3",
+    "34": "public.ac3-audio",
+    "35": "com.apple.property-list",
+    "36": "public.data",
+    "37": "com.apple.photos.apple-adjustment-envelope",
+    "38": "public.avif",
+    "39": "public.jpeg-xl",
 }
 
 
@@ -246,32 +281,10 @@ def uti_for_compact_uti(compact_uti: str | int | None) -> str | None:
 
 
 def uti_if_raw(uti: str | None) -> str | None:
-    """Return uti if it is a RAW image type, else None"""
-    return uti if uti and "raw-image" in uti else None
+    """Return uti if it is a RAW image type, else None
 
-
-def get_library_compact_uti_codes(cursor, asset_table: str) -> dict[str, str]:
-    """Map each ZCOMPACTUTI code in a Photos 7+ library to a UTI, from the
-    library's own original resources: the asset UTI most often seen with each code
-
-    Args:
-        cursor: sqlite3 cursor on the library's Photos.sqlite
-        asset_table: name of the asset table, e.g. ZASSET
+    Every RAW type in COMPACT_UTI_CODES (codes 9 to 22) has "raw-image" in its UTI,
+    as do the RAW UTIs for file extensions, so this works for codes, "_" + UTI
+    values and UTIs from a file's extension alike.
     """
-    cursor.execute(
-        f""" SELECT
-        ZINTERNALRESOURCE.ZCOMPACTUTI,
-        {asset_table}.ZUNIFORMTYPEIDENTIFIER,
-        COUNT(*)
-        FROM ZINTERNALRESOURCE
-        JOIN {asset_table} ON {asset_table}.Z_PK = ZINTERNALRESOURCE.ZASSET
-        WHERE ZINTERNALRESOURCE.ZRESOURCETYPE = 0
-        AND ZINTERNALRESOURCE.ZDATASTORESUBTYPE = 1
-        GROUP BY 1, 2
-        ORDER BY 3
-        """
-    )
-    # rows are in ascending count, so the most common UTI for each code wins
-    return {
-        str(code): uti for code, uti, _ in cursor.fetchall() if code is not None and uti
-    }
+    return uti if uti and "raw-image" in uti else None
