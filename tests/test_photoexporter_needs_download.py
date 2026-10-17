@@ -10,6 +10,7 @@ never touched.
 from __future__ import annotations
 
 import pathlib
+import shutil
 
 import pytest
 
@@ -119,3 +120,175 @@ def test_edited_live_photo_missing_edited_mov_photokit_downloads(
     assert len(download_calls) == 1
     assert download_calls[0].use_photokit
     assert download_calls[0].live_photo
+
+
+# RAW+JPEG pairs (#11). On Photos 7+ these libraries have no RAW type in the
+# column osxphotos reads for Photos 5 and 6, and uti_raw came from the RAW file
+# on disk, so it was None while the RAW was evicted.
+RAW_PAIR_LIBRARIES = [
+    "./tests/Test-13.0.0.photoslibrary",
+    "./tests/Test-15.4.1.photoslibrary",
+    "./tests/Test-26.1.photoslibrary",
+]
+CR2_UTI = "com.canon.cr2-raw-image"
+# IMG_2000.JPG: a pair not copied into the library, missing: path_raw is None
+UUID_MISSING_PAIR = "8E1D7BC9-9321-44F9-8CFB-4083F6B9232A"
+# IMG_1994.JPG: a pair stored in the library with its CR2 on disk
+UUID_RAW_PAIR = "A92D9C26-3A50-4197-9388-CB5F7DB9FA91"
+RAW_PAIRS = [(UUID_MISSING_PAIR, "IMG_2000"), (UUID_RAW_PAIR, "IMG_1994")]
+
+
+@pytest.fixture(scope="module", params=RAW_PAIR_LIBRARIES)
+def raw_photosdb(request):
+    return osxphotos.PhotosDB(dbfile=request.param)
+
+
+@pytest.fixture
+def evicted_pair(raw_photosdb, monkeypatch):
+    """Make IMG_1994 look evicted to iCloud: neither its JPEG nor its RAW is on disk
+
+    Returns the paths of IMG_1994's JPEG and CR2 in the library, read beforehand.
+    """
+    present = raw_photosdb.get_photo(UUID_RAW_PAIR)
+    files = (present.path, present.path_raw)
+    assert all(files)
+    for attr in ("path", "path_raw"):
+        prop = getattr(PhotoInfo, attr)
+
+        def evicted_path(self, prop=prop):
+            return None if self.uuid == UUID_RAW_PAIR else prop.fget(self)
+
+        monkeypatch.setattr(PhotoInfo, attr, property(evicted_path))
+    return files
+
+
+class FakeDownload:
+    """Stands in for _stage_missing_photos_for_export_helper and records each call
+
+    It stages copies of the given files under the given names, as an AppleScript
+    download does; with no files it stages nothing, as a failed download does.
+    """
+
+    def __init__(self, staging: pathlib.Path | None = None, files=None):
+        self.calls = []
+        self.staging = staging
+        self.files = files or {}
+
+    def __call__(self, exporter, options):
+        self.calls.append(options)
+        staged = StagedFiles()
+        for kind, (src, name) in self.files.items():
+            staged_path = self.staging / name
+            shutil.copy(src, staged_path)
+            setattr(staged, kind, str(staged_path))
+        return staged
+
+
+def _export_raw_pair(photo, dest_dir, monkeypatch, download):
+    """Export a RAW+JPEG pair with --update --download-missing"""
+    monkeypatch.setattr(
+        PhotoExporter,
+        "_stage_missing_photos_for_export_helper",
+        lambda self, options: download(self, options),
+    )
+    # each export is a separate run, with the export DB opened afresh
+    export_db = osxphotos.ExportDB(dest_dir.parent / "export.db", dest_dir)
+    options = ExportOptions(
+        update=True,
+        download_missing=True,
+        raw_photo=True,
+        export_db=export_db,
+    )
+    try:
+        return PhotoExporter(photo).export(dest_dir, options=options)
+    finally:
+        export_db.close()
+
+
+def _lower(paths):
+    """Paths as lower-case strings: the RAW's extension case comes from Photos"""
+    return sorted(str(path).lower() for path in paths)
+
+
+@pytest.fixture
+def exported_pair(raw_photosdb, evicted_pair, monkeypatch, tmp_path, request):
+    """Export an evicted RAW+JPEG pair once, downloading <stem>.JPG and <stem>.CR2
+
+    The downloaded content is IMG_1994's. Returns the photo, the export
+    directory and the stem.
+    """
+    uuid, stem = request.param
+    photo = raw_photosdb.get_photo(uuid)
+    assert photo.has_raw and not photo.path and not photo.path_raw
+
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    jpeg, raw = evicted_pair
+    download = FakeDownload(
+        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, f"{stem}.CR2")}
+    )
+    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert len(download.calls) == 1
+    assert _lower(first.new) == _lower(
+        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
+    )
+    return photo, dest_dir, stem
+
+
+@pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
+def test_raw_pair_up_to_date_no_download(exported_pair, monkeypatch):
+    """An evicted RAW+JPEG pair already exported and unchanged is skipped
+    without a download (#11)"""
+    photo, dest_dir, stem = exported_pair
+    download = FakeDownload()
+    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert download.calls == []
+    assert _lower(results.skipped) == _lower(
+        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
+    )
+    assert results.new == results.updated == results.missing == []
+
+
+@pytest.mark.parametrize("changed", ["JPG", "CR2"])
+@pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
+def test_raw_pair_changed_downloads(exported_pair, monkeypatch, changed):
+    """An evicted pair whose JPEG or RAW changed on the destination is
+    downloaded again; one not yet exported is downloaded by exported_pair"""
+    photo, dest_dir, stem = exported_pair
+    (dest_dir / f"{stem}.{changed}").write_bytes(b"changed")
+    download = FakeDownload()
+    _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert len(download.calls) == 1
+    assert download.calls[0].raw_photo
+
+
+@pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
+def test_missing_raw_recorded_with_real_extension(exported_pair, monkeypatch):
+    """A RAW that needs updating but doesn't download is reported missing as
+    .CR2, not .raw"""
+    photo, dest_dir, stem = exported_pair
+    (dest_dir / f"{stem}.CR2").write_bytes(b"changed")
+    download = FakeDownload()
+    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert len(download.calls) == 1
+    assert _lower(results.missing) == _lower(
+        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
+    )
+
+
+@pytest.mark.parametrize("uuid", [UUID_MISSING_PAIR, UUID_RAW_PAIR])
+def test_uti_raw_without_raw_on_disk(raw_photosdb, evicted_pair, uuid):
+    """uti_raw comes from the Photos database when the RAW isn't on disk"""
+    photo = raw_photosdb.get_photo(uuid)
+    assert photo.path_raw is None
+    assert photo.uti_raw == CR2_UTI
+
+
+@pytest.mark.parametrize("uuid", [UUID_MISSING_PAIR, UUID_RAW_PAIR])
+def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, uuid):
+    """uti_raw still comes from the RAW file when it is on disk"""
+    photo = raw_photosdb.get_photo(uuid)
+    if photo.path_raw:
+        assert photo.uti_raw == CR2_UTI
