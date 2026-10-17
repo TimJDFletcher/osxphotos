@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pathlib
 import shutil
+import sqlite3
 
 import pytest
 
@@ -18,6 +19,11 @@ import osxphotos
 from osxphotos.exportoptions import ExportOptions
 from osxphotos.photoexporter import PhotoExporter, StagedFiles
 from osxphotos.photoinfo import PhotoInfo
+from osxphotos.photosdb.photosdb_utils import (
+    COMPACT_UTI_CODES,
+    get_library_compact_uti_codes,
+    uti_for_compact_uti,
+)
 
 # Edited Live Photos whose files, edited video included, are in the library
 EDITED_LIVE_PHOTOS = [
@@ -292,3 +298,35 @@ def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, uuid):
     photo = raw_photosdb.get_photo(uuid)
     if photo.path_raw:
         assert photo.uti_raw == CR2_UTI
+
+
+@pytest.mark.parametrize(
+    "compact_uti,library_codes,uti",
+    [
+        ("11", None, CR2_UTI),
+        (11, None, CR2_UTI),
+        ("21", None, "com.fuji.raw-image"),
+        ("_org.webmproject.webp", None, "org.webmproject.webp"),
+        ("99", None, None),
+        ("99", {"99": "com.sony.arw-raw-image"}, "com.sony.arw-raw-image"),
+        ("11", {"11": "public.jpeg"}, CR2_UTI),
+        (None, None, None),
+    ],
+)
+def test_uti_for_compact_uti(compact_uti, library_codes, uti):
+    """ZCOMPACTUTI is a code, or "_" and the UTI itself"""
+    assert uti_for_compact_uti(compact_uti, library_codes) == uti
+
+
+@pytest.mark.parametrize("library", RAW_PAIR_LIBRARIES)
+def test_library_compact_uti_codes_match_table(library):
+    """The codes the test libraries use for their originals agree with the table"""
+    db = pathlib.Path(library) / "database" / "Photos.sqlite"
+    conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    try:
+        codes = get_library_compact_uti_codes(conn.cursor(), "ZASSET")
+    finally:
+        conn.close()
+    assert codes
+    for code, uti in codes.items():
+        assert COMPACT_UTI_CODES.get(code, uti) == uti

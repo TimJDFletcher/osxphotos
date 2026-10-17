@@ -942,8 +942,8 @@ class PhotoInfo:
 
         if rawpath := self.path_raw:
             return get_uti_for_extension(pathlib.Path(rawpath).suffix)
-        else:
-            return None
+        # RAW not on disk, e.g. evicted to iCloud: use the type in the Photos database
+        return self._info["UTI_raw"]
 
     @property
     def ismovie(self) -> bool:

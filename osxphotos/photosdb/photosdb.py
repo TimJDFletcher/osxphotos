@@ -62,8 +62,10 @@ from ..unicode import normalize_unicode
 from ..utils import _check_file_exists, get_last_library_path, noop
 from .photosdb_utils import (
     get_db_version,
+    get_library_compact_uti_codes,
     get_model_version,
     get_photos_version_from_model,
+    uti_for_compact_uti,
 )
 
 if is_macos:
@@ -72,6 +74,12 @@ if is_macos:
 logger = logging.getLogger("osxphotos")
 
 __all__ = ["PhotosDB", "PhotosDBReadError"]
+
+
+def _raw_uti(uti: str | None) -> str | None:
+    """Return uti if it is a RAW image type, else None"""
+    return uti if uti and "raw-image" in uti else None
+
 
 # TODO: Add test for imageTimeZoneOffsetSeconds = None
 # TODO: Add test for __str__
@@ -2540,7 +2548,7 @@ class PhotosDB:
             sql_raw = f""" SELECT
                 {asset_table}.ZUUID,
                 ZINTERNALRESOURCE.ZDATALENGTH,
-                null,
+                ZINTERNALRESOURCE.ZCOMPACTUTI,
                 ZINTERNALRESOURCE.ZDATASTORESUBTYPE,
                 ZINTERNALRESOURCE.ZRESOURCETYPE,
                 ZINTERNALRESOURCE.ZFILESYSTEMBOOKMARK
@@ -2565,8 +2573,20 @@ class PhotosDB:
             """
 
         c.execute(sql_raw)
+        raw_rows = c.fetchall()
 
-        for row in c:
+        if self._photos_ver >= 7:
+            # Photos 7+ stores the RAW's type as a compact UTI code
+            library_codes = None
+            if any(uti_for_compact_uti(row[2]) is None for row in raw_rows):
+                library_codes = get_library_compact_uti_codes(c, asset_table)
+            raw_rows = [
+                (row[0], row[1], _raw_uti(uti_for_compact_uti(row[2], library_codes)))
+                + tuple(row[3:])
+                for row in raw_rows
+            ]
+
+        for row in raw_rows:
             uuid = row[0]
             if uuid in self._dbphotos:
                 self._dbphotos[uuid]["has_raw"] = True

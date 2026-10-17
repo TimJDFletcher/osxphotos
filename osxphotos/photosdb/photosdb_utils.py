@@ -215,3 +215,65 @@ def get_db_path_for_library(photos_library: str | pathlib.Path) -> pathlib.Path:
     elif photos_library.is_dir():
         photos_library = photos_library / "database" / "Photos.sqlite"
     return photos_library
+
+
+# ZINTERNALRESOURCE.ZCOMPACTUTI codes in Photos 7+ libraries, seen in Photos 8 to 11.
+# A type with no code is stored as "_" followed by its UTI, e.g. "_org.webmproject.webp".
+COMPACT_UTI_CODES = {
+    "1": "public.jpeg",
+    "3": "public.heic",
+    "6": "public.png",
+    "8": "public.tiff",
+    "9": "com.adobe.raw-image",
+    "11": "com.canon.cr2-raw-image",
+    "21": "com.fuji.raw-image",
+    "23": "com.apple.quicktime-movie",
+    "24": "public.mpeg-4",
+}
+
+
+def uti_for_compact_uti(
+    compact_uti: str | int | None, library_codes: dict[str, str] | None = None
+) -> str | None:
+    """Return the UTI for a ZINTERNALRESOURCE.ZCOMPACTUTI value (Photos 7+)
+
+    Args:
+        compact_uti: the ZCOMPACTUTI value
+        library_codes: codes not in COMPACT_UTI_CODES, mapped to UTIs from the
+            library itself (see get_library_compact_uti_codes)
+
+    Returns: the UTI, or None if it can't be determined
+    """
+    if compact_uti is None:
+        return None
+    compact_uti = str(compact_uti)
+    if compact_uti.startswith("_"):
+        return compact_uti[1:] or None
+    return COMPACT_UTI_CODES.get(compact_uti) or (library_codes or {}).get(compact_uti)
+
+
+def get_library_compact_uti_codes(cursor, asset_table: str) -> dict[str, str]:
+    """Map each ZCOMPACTUTI code in a Photos 7+ library to a UTI, from the
+    library's own original resources: the asset UTI most often seen with each code
+
+    Args:
+        cursor: sqlite3 cursor on the library's Photos.sqlite
+        asset_table: name of the asset table, e.g. ZASSET
+    """
+    cursor.execute(
+        f""" SELECT
+        ZINTERNALRESOURCE.ZCOMPACTUTI,
+        {asset_table}.ZUNIFORMTYPEIDENTIFIER,
+        COUNT(*)
+        FROM ZINTERNALRESOURCE
+        JOIN {asset_table} ON {asset_table}.Z_PK = ZINTERNALRESOURCE.ZASSET
+        WHERE ZINTERNALRESOURCE.ZRESOURCETYPE = 0
+        AND ZINTERNALRESOURCE.ZDATASTORESUBTYPE = 1
+        GROUP BY 1, 2
+        ORDER BY 3
+        """
+    )
+    # rows are in ascending count, so the most common UTI for each code wins
+    return {
+        str(code): uti for code, uti, _ in cursor.fetchall() if code is not None and uti
+    }
