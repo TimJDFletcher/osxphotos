@@ -21,6 +21,18 @@ from osxphotos.exportoptions import ExportOptions
 from osxphotos.photoexporter import PhotoExporter, StagedFiles
 from osxphotos.photoinfo import PhotoInfo
 
+# Unedited Live Photos whose files, video included, are in the library
+UNEDITED_LIVE_PHOTOS = [
+    (
+        "./tests/Test-Media-Types-15.7.2.photoslibrary",
+        "EC19EA1A-FC91-449C-8925-B13D863E2EDB",  # IMG_3582.HEIC
+    ),
+    (
+        "./tests/Test-Live-15.7.2.photoslibrary",
+        "C3090F66-942C-41D3-BEC7-4F2B4876A109",  # IMG_4062.HEIC
+    ),
+]
+
 # Edited Live Photos whose files, edited video included, are in the library
 EDITED_LIVE_PHOTOS = [
     (
@@ -63,10 +75,11 @@ def _export(photo, dest_dir, **options):
 
 
 def _export_edited_live_without_edited_mov(
-    monkeypatch, tmp_path, library, uuid, use_photokit
+    monkeypatch, tmp_path, library, uuid, use_photokit, change_edited=False
 ):
     """Export an edited Live Photo whose edited video was never on the
-    destination, then export it again with the edited files evicted
+    destination, then export it again with the edited files evicted; with
+    change_edited, the edited image on the destination is changed in between
 
     Returns the second export's results and the destination of the edited image.
     """
@@ -96,6 +109,9 @@ def _export_edited_live_without_edited_mov(
     edited_mov = edited_dest.parent / f"{edited_dest.stem}.mov"
     assert edited_dest.exists()
     assert not edited_mov.exists()
+
+    if change_edited:
+        edited_dest.write_bytes(b"changed")
 
     # Second run: the edited image is evicted from the library too
     monkeypatch.setattr(PhotoInfo, "path_edited", None)
@@ -129,3 +145,44 @@ def test_edited_live_photo_missing_edited_mov_photokit_downloads(
     assert len(download_calls) == 1
     assert download_calls[0].use_photokit
     assert download_calls[0].live_photo
+
+
+@pytest.mark.parametrize("library,uuid", EDITED_LIVE_PHOTOS)
+def test_edited_live_photo_changed_edited_image_applescript_downloads(
+    monkeypatch, tmp_path, download_calls, library, uuid
+):
+    """Without the edited video, an edited Live Photo whose edited image
+    changed on the destination is still downloaded through AppleScript"""
+    _export_edited_live_without_edited_mov(
+        monkeypatch, tmp_path, library, uuid, use_photokit=False, change_edited=True
+    )
+    assert len(download_calls) == 1
+    assert download_calls[0].edited
+    assert not download_calls[0].use_photokit
+
+
+@pytest.mark.parametrize("library,uuid", UNEDITED_LIVE_PHOTOS)
+def test_unedited_live_photo_missing_mov_applescript_downloads(
+    monkeypatch, tmp_path, download_calls, library, uuid
+):
+    """An unedited Live Photo whose .mov isn't on the destination is still
+    downloaded through AppleScript, which can export an original's video"""
+    photo = osxphotos.PhotosDB(dbfile=library).get_photo(uuid)
+    assert photo.live_photo and not photo.hasadjustments
+    assert photo.path and photo.path_live_photo
+
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+    first = _export(photo, dest_dir, live_photo=True)
+    image_dest = dest_dir / photo.original_filename
+    mov_dest = image_dest.with_suffix(".mov")
+    assert sorted(first.exported) == sorted([str(image_dest), str(mov_dest)])
+    mov_dest.unlink()
+
+    # path_live_photo is a cached_property, cached by the first export
+    monkeypatch.setattr(PhotoInfo, "path", None)
+    monkeypatch.setattr(photo, "path_live_photo", None)
+    _export(photo, dest_dir, live_photo=True, download_missing=True)
+    assert len(download_calls) == 1
+    assert download_calls[0].live_photo
+    assert not download_calls[0].use_photokit
