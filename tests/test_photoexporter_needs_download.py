@@ -502,21 +502,19 @@ def test_raf_only_original_checked_under_its_upper_case_name(
 
 
 @pytest.mark.parametrize(
-    "compact_uti,library_codes,uti",
+    "compact_uti,uti",
     [
-        ("11", None, CR2_UTI),
-        (11, None, CR2_UTI),
-        ("21", None, RAF_UTI),
-        ("_org.webmproject.webp", None, "org.webmproject.webp"),
-        ("99", None, None),
-        ("99", {"99": "com.sony.arw-raw-image"}, "com.sony.arw-raw-image"),
-        ("11", {"11": "public.jpeg"}, CR2_UTI),
-        (None, None, None),
+        ("11", CR2_UTI),
+        (11, CR2_UTI),
+        ("21", RAF_UTI),
+        ("_org.webmproject.webp", "org.webmproject.webp"),
+        ("99", None),
+        (None, None),
     ],
 )
-def test_uti_for_compact_uti(compact_uti, library_codes, uti):
+def test_uti_for_compact_uti(compact_uti, uti):
     """ZCOMPACTUTI is a code, or "_" and the UTI itself"""
-    assert uti_for_compact_uti(compact_uti, library_codes) == uti
+    assert uti_for_compact_uti(compact_uti) == uti
 
 
 @pytest.mark.parametrize("library", RAW_PAIR_LIBRARIES)

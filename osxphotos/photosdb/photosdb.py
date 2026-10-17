@@ -66,6 +66,7 @@ from .photosdb_utils import (
     get_model_version,
     get_photos_version_from_model,
     uti_for_compact_uti,
+    uti_if_raw,
 )
 
 if is_macos:
@@ -74,11 +75,6 @@ if is_macos:
 logger = logging.getLogger("osxphotos")
 
 __all__ = ["PhotosDB", "PhotosDBReadError"]
-
-
-def _raw_uti(uti: str | None) -> str | None:
-    """Return uti if it is a RAW image type, else None"""
-    return uti if uti and "raw-image" in uti else None
 
 
 # TODO: Add test for imageTimeZoneOffsetSeconds = None
@@ -2577,13 +2573,16 @@ class PhotosDB:
 
         if self._photos_ver >= 7:
             # Photos 7+ stores the RAW's type as a compact UTI code
-            library_codes = None
-            if any(uti_for_compact_uti(row[2]) is None for row in raw_rows):
+            utis = [uti_for_compact_uti(row[2]) for row in raw_rows]
+            if None in utis:
                 library_codes = get_library_compact_uti_codes(c, asset_table)
+                utis = [
+                    uti or library_codes.get(str(row[2]))
+                    for uti, row in zip(utis, raw_rows)
+                ]
             raw_rows = [
-                (row[0], row[1], _raw_uti(uti_for_compact_uti(row[2], library_codes)))
-                + tuple(row[3:])
-                for row in raw_rows
+                (row[0], row[1], uti_if_raw(uti)) + tuple(row[3:])
+                for uti, row in zip(utis, raw_rows)
             ]
 
         for row in raw_rows:

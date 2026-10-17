@@ -232,24 +232,22 @@ COMPACT_UTI_CODES = {
 }
 
 
-def uti_for_compact_uti(
-    compact_uti: str | int | None, library_codes: dict[str, str] | None = None
-) -> str | None:
+def uti_for_compact_uti(compact_uti: str | int | None) -> str | None:
     """Return the UTI for a ZINTERNALRESOURCE.ZCOMPACTUTI value (Photos 7+)
 
-    Args:
-        compact_uti: the ZCOMPACTUTI value
-        library_codes: codes not in COMPACT_UTI_CODES, mapped to UTIs from the
-            library itself (see get_library_compact_uti_codes)
-
-    Returns: the UTI, or None if it can't be determined
+    Returns: the UTI, or None if the value is None or a code not in COMPACT_UTI_CODES
     """
     if compact_uti is None:
         return None
     compact_uti = str(compact_uti)
     if compact_uti.startswith("_"):
         return compact_uti[1:] or None
-    return COMPACT_UTI_CODES.get(compact_uti) or (library_codes or {}).get(compact_uti)
+    return COMPACT_UTI_CODES.get(compact_uti)
+
+
+def uti_if_raw(uti: str | None) -> str | None:
+    """Return uti if it is a RAW image type, else None"""
+    return uti if uti and "raw-image" in uti else None
 
 
 def get_library_compact_uti_codes(cursor, asset_table: str) -> dict[str, str]:
