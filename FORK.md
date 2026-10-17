@@ -30,7 +30,7 @@ uv pip install -e ".[dev]"
   tests/test_concurrent_export.py tests/test_live_catalina_10_15_1.py
 ```
 
-On 2026-10-17, on macOS 27.0.1 (arm64) with Python 3.13.5 and the branch unchanged at v0.77.2, the run (without the two `needs_download` modules) took about 95 s: **439 passed, 17 skipped, 0 failed**. With the fixes and both modules: **567 passed, 17 skipped, 0 failed** (128 of them in the two new modules).
+On 2026-10-17, on macOS 27.0.1 (arm64) with Python 3.13.5 and the branch unchanged at v0.77.2, the run (without the two `needs_download` modules) took about 95 s: **439 passed, 17 skipped, 0 failed**. With the fixes and both modules (v0.77.2-tim.3): **593 passed, 17 skipped, 0 failed** (154 of them in the two new modules).
 
 These modules cover `photoexporter.py`, `--update`, `--download-missing` and the export CLI. On macOS 13 and later, `tests/conftest.py` uses `tests/Test-13.0.0.photoslibrary` as the main test library; `test_cli.py` also reads several others.
 
@@ -66,7 +66,8 @@ Leave these out. They need the Photos app or the system library:
 
 - **`uti_raw` of an evicted RAW.** On Photos 7+ `PhotoInfo.uti_raw` now reports the RAW's type from the Photos database when the RAW isn't on disk, where it used to be `None`. That shows wherever `uti_raw` is read: `asdict()` and JSON output, `print_photo_info`, queries, and the dry-run filename prediction (`_predict_export_filenames`).
 - **`tests/test-Test-26.1.json`.** Because of that, IMG_2000's `uti_raw` there changed from `null` to `com.canon.cr2-raw-image`: its RAW is missing, and the type now comes from the database.
-- **Unknown compact UTI codes.** `COMPACT_UTI_CODES` maps the codes seen in Photos 8 to 11 (1 jpeg, 3 heic, 6 png, 9 dng, 11 cr2, 21 raf were each consistent across the libraries seen). A code not in it is learned from the library: first from original resources with that code (keyed by the asset's UTI), then from RAWs with that code whose file is on disk (the UTI for the file's extension). So one local RAW of a type, say a Sony ARW, resolves the evicted RAWs of that type. With neither, `uti_raw` stays `None` and the check guesses `.raw`, as before. The table comes first because the library-derived guesses are only as good as the library's records.
+- **Compact UTI codes.** `ZINTERNALRESOURCE.ZCOMPACTUTI` (Photos 7+, macOS 12.0.1 on; VARCHAR in every version) holds Apple's PLUniformFileType codes. `COMPACT_UTI_CODES` in `photosdb_utils.py` is Apple's full table, codes 1 and 3 to 39 (2 is unassigned), read from PhotoLibraryServices.framework in the macOS 27 dyld shared cache: `+[PLUniformTypeIdentifierIntegratedLookup compactRepresentationForIdentifier:]` / `identifierFromCompactRepresentation:`, via `PLFileTypeFromIdentifier` / `PLUTTypeFromUniformFileType`, table built in `populateExtensionFileTypeMappings`. Codes 9 to 22 are the RAW types (`PLUniformFileTypeIsRawImage`, mask 0x7ffe00); 36 is `public.data` and 37 is AAE. Every code in use agrees across 19 libraries (the macOS 12 to 27 test libraries plus one real library), and `test_library_compact_uti_codes_match_table` checks each Photos 7+ test library.
+- **How a RAW's code is resolved.** In order: the table; `"_" + UTI`, which Photos stores for a type without a code; and, for a code above 39 (a type a later Photos adds), the library's RAWs with that code whose file is on disk (the UTI for the file's extension), so one local RAW of a new type resolves the evicted RAWs of that type. With none of these, `uti_raw` stays `None` and the check guesses `.raw`, as before. `uti_if_raw` still matches `raw-image` in the UTI rather than Apple's 9 to 22 range: every RAW in the table has it, and it also covers `"_"` values and UTIs from a file's extension. An earlier step learnt codes from the library's original resources keyed on `ZASSET.ZUNIFORMTYPEIDENTIFIER`; that is the current version's UTI, so an edited RAW-only original (5E425216..., IMG_0003_DSC03584.dng in Test-16.0.0-beta and Test-27.0_DevBeta: code 9, asset UTI `public.jpeg`) taught it the wrong type. With the full table it was dropped.
 
 ## A possible upstream bug: reusing one ExportDB
 
@@ -81,7 +82,15 @@ The fixes go upstream as two PRs, one per fix: they touch different code and nei
 | Edited Live Photos re-downloaded (#12) | `upstream/edited-live-photo` | `osxphotos/photoexporter.py`, `tests/test_photoexporter_needs_download.py`, its `CHANGELOG.md` line |
 | RAW type from the Photos database (#11, incl. `--cleanup`) | `upstream/raw-type-from-db` | `osxphotos/photoinfo.py`, `osxphotos/photosdb/photosdb.py`, `osxphotos/photosdb/photosdb_utils.py`, `tests/test-Test-26.1.json`, `tests/test_photoexporter_needs_download_raw.py`, its two `CHANGELOG.md` lines |
 
-Leave out `fork/` and this file. The tests don't need `fork/no_photos.py`; it only guards runs here. The two PRs each add lines under `[Unreleased]` → `Fixed`, so whichever merges second needs a trivial CHANGELOG rebase.
+Leave out `fork/` and this file. The tests don't need `fork/no_photos.py`; it only guards runs here.
+
+Notes to put in the PRs (no code change for these):
+
+- Both PRs: `_stage_missing_photos_for_export` counts `options.preview and not staged.preview` as something to download, but `_needs_download_for_update` never checks the preview. That gap was there before and is out of scope.
+- Edited Live Photo PR: under AppleScript `<name>_edited.mov` is still appended to `results.missing` on each run, consistent with the documented limitation in `_predict_export_filenames`.
+- RAW PR: `uti_raw` now returns a UTI for evicted RAWs on Photos 7+. That shows in `asdict()`/JSON, `print_photo_info`, and the dry-run prediction, which now names the RAW (`.cr2`, not `.raw`): an improvement.
+- RAW PR: `tests/test-Test-26.1.json` changes only IMG_2000's `uti_raw`, which `test_tahoe_26_1.py` reads; `tests/test-Test-27.0_DevBeta.json` needs no change.
+- RAW PR: the update check predicts the RAW's name with a lower-case extension (`IMG_1994.cr2`) while the export keeps Photos' case (`IMG_1994.CR2`). The CLI finds it because `DirectoryStatCache` matches names case-insensitively on macOS (ExportDB and cleanup lower-case names too). A library API caller exporting with `stat_cache=None` to a case-sensitive destination would still miss it; production code is unchanged. The PhotoExporter-level tests give each export a `DirectoryStatCache`, as the CLI does, so they don't depend on the filesystem's case behaviour. The two PRs each add lines under `[Unreleased]` → `Fixed`, so whichever merges second needs a trivial CHANGELOG rebase.
 
 To rebuild a branch after trunk changes, check those files out from `fixes-0.77.2` onto `v0.77.2` and add the CHANGELOG lines by hand.
 
