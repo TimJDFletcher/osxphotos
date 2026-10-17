@@ -31,6 +31,7 @@ from osxphotos.exportoptions import ExportOptions
 from osxphotos.photoexporter import PhotoExporter, StagedFiles
 from osxphotos.photoinfo import PhotoInfo
 from osxphotos.photosdb.photosdb_utils import uti_for_compact_uti
+from osxphotos.stat_cache import DirectoryStatCache
 from osxphotos.uti import get_uti_for_extension
 
 
@@ -80,14 +81,22 @@ def download(monkeypatch, tmp_path):
     return fake
 
 
-def _export(photo, dest_dir, **options):
+def _export(photo, dest_dir, case_sensitive=False, **options):
     """Export photo with --update and options as a separate run, with the
-    export DB opened afresh as the CLI does"""
+    export DB and a DirectoryStatCache opened afresh as the CLI does
+
+    The stat cache matches names on the destination case-insensitively, as the
+    CLI's does on macOS, or exactly with case_sensitive, so the results don't
+    depend on the case behaviour of the filesystem under tmp_path.
+    """
     export_db = osxphotos.ExportDB(dest_dir.parent / "export.db", dest_dir)
+    stat_cache = DirectoryStatCache(case_sensitive=case_sensitive)
     try:
         return PhotoExporter(photo).export(
             dest_dir,
-            options=ExportOptions(update=True, export_db=export_db, **options),
+            options=ExportOptions(
+                update=True, export_db=export_db, stat_cache=stat_cache, **options
+            ),
         )
     finally:
         export_db.close()
@@ -263,9 +272,15 @@ def evicted_pair(raw_photosdb, monkeypatch):
     return files
 
 
-def _export_raw_pair(photo, dest_dir):
+def _export_raw_pair(photo, dest_dir, case_sensitive=False):
     """Export a RAW+JPEG pair with --update --download-missing"""
-    return _export(photo, dest_dir, download_missing=True, raw_photo=True)
+    return _export(
+        photo,
+        dest_dir,
+        case_sensitive=case_sensitive,
+        download_missing=True,
+        raw_photo=True,
+    )
 
 
 class ExportedPair(NamedTuple):
@@ -379,7 +394,7 @@ def test_raf_pair_exported_and_checked_under_lower_case_raf(
     dest_dir = tmp_path / "export"
     dest_dir.mkdir()
 
-    first = _export_raw_pair(photo, dest_dir)
+    first = _export_raw_pair(photo, dest_dir, case_sensitive=True)
     assert download.calls == []
     names = sorted(path.name for path in dest_dir.iterdir())
     assert names == ["IMG_1994.JPG", "IMG_1994.raf"]
@@ -387,7 +402,7 @@ def test_raf_pair_exported_and_checked_under_lower_case_raf(
 
     for attr in ("path", "path_raw"):
         monkeypatch.setattr(PhotoInfo, attr, None)
-    results = _export_raw_pair(photo, dest_dir)
+    results = _export_raw_pair(photo, dest_dir, case_sensitive=True)
     assert download.calls == []
     assert sorted(results.skipped) == [str(dest_dir / name) for name in names]
 
@@ -411,13 +426,13 @@ def test_raf_only_original_checked_under_its_upper_case_name(
     raf_bytes = tmp_path / "raf_bytes"
     raf_bytes.write_bytes(b"FUJIFILMCCD-RAW ")
     download.stage({"original": (raf_bytes, RAF_ONLY_FILENAME)})
-    first = _export_raw_pair(photo, dest_dir)
+    first = _export_raw_pair(photo, dest_dir, case_sensitive=True)
     assert len(download.calls) == 1
     assert [path.name for path in dest_dir.iterdir()] == [RAF_ONLY_FILENAME]
     assert first.new == [str(dest_dir / RAF_ONLY_FILENAME)]
 
     download.reset()
-    results = _export_raw_pair(photo, dest_dir)
+    results = _export_raw_pair(photo, dest_dir, case_sensitive=True)
     assert download.calls == []
     assert results.skipped == [str(dest_dir / RAF_ONLY_FILENAME)]
     assert results.new == results.updated == results.missing == []
