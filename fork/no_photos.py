@@ -5,6 +5,10 @@ would run AppleScript (photoscript, py-applescript, osascript), ask PhotoKit
 for access, open or kill Photos, or look up the system or last-opened Photos
 library raises PhotosAccessBlocked instead, so it fails rather than touching
 the real library. See FORK.md.
+
+With `--linux-stat-cache` it also gives DirectoryStatCache its default off
+macOS, matching names exactly, so a test that only passes with macOS's
+case-insensitive matching fails here as it would on upstream's Ubuntu CI.
 """
 
 import os
@@ -49,6 +53,14 @@ def _guarded_popen_init(self, args, *rest, **kwargs):
     return _real_popen_init(self, args, *rest, **kwargs)
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--linux-stat-cache",
+        action="store_true",
+        help="fork/no_photos.py: match names exactly in DirectoryStatCache, as off macOS",
+    )
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_load_initial_conftests(early_config, parser, args):
     # Runs before tests/conftest.py and the test modules import osxphotos, so
@@ -73,3 +85,9 @@ def pytest_load_initial_conftests(early_config, parser, args):
     osxphotos.photokit.request_photokit_authorization = _blocked(
         "request_photokit_authorization"
     )
+
+    if early_config.known_args_namespace.linux_stat_cache:
+        import osxphotos.stat_cache
+
+        # DirectoryStatCache reads this when it's created, to pick its default
+        osxphotos.stat_cache.is_macos = False
