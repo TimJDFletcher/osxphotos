@@ -37,9 +37,7 @@ def _is_blocked_command(args) -> bool:
         return True
     if cmd in ("killall", "pkill") and "Photos" in joined:
         return True
-    if cmd == "open" and "Photos" in joined:
-        return True
-    return False
+    return cmd == "open" and "Photos" in joined
 
 
 _real_popen_init = subprocess.Popen.__init__
