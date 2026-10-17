@@ -14,6 +14,8 @@ import json
 import pathlib
 import shutil
 import sqlite3
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import pytest
 from click.testing import CliRunner
@@ -42,19 +44,63 @@ EDITED_LIVE_PHOTOS = [
 ]
 
 
+class FakeDownload:
+    """Stands in for _stage_missing_photos_for_export_helper and records each call
+
+    It stages copies of the files given to stage() under the given names, as
+    an AppleScript download does; with no files it stages nothing, as a failed
+    download does.
+    """
+
+    def __init__(self, staging: pathlib.Path):
+        self.staging = staging
+        self.calls = []
+        self.files = {}
+
+    def stage(self, files):
+        """Stage files, {kind: (source, name)}, on each call from now on"""
+        self.files = files
+
+    def reset(self):
+        """Forget the calls so far and stage nothing from now on"""
+        self.calls = []
+        self.files = {}
+
+    def __call__(self, exporter, options):
+        self.calls.append(options)
+        staged = StagedFiles()
+        for kind, (src, name) in self.files.items():
+            staged_path = self.staging / name
+            shutil.copy(src, staged_path)
+            setattr(staged, kind, str(staged_path))
+        return staged
+
+
 @pytest.fixture
-def download_calls(monkeypatch):
-    """Record calls to the download helper instead of downloading"""
-    calls = []
-
-    def fake_helper(self, options):
-        calls.append(options)
-        return StagedFiles()
-
+def download(monkeypatch, tmp_path):
+    """A FakeDownload in place of the download helper, so nothing is downloaded"""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    fake = FakeDownload(staging)
     monkeypatch.setattr(
-        PhotoExporter, "_stage_missing_photos_for_export_helper", fake_helper
+        PhotoExporter,
+        "_stage_missing_photos_for_export_helper",
+        lambda self, options: fake(self, options),
     )
-    return calls
+    return fake
+
+
+def _export(photo, dest_dir, **options):
+    """Export photo with --update and options as a separate run, with the
+    export DB opened afresh as the CLI does"""
+    export_db = osxphotos.ExportDB(dest_dir.parent / "export.db", dest_dir)
+    try:
+        return PhotoExporter(photo).export(
+            dest_dir,
+            options=ExportOptions(update=True, export_db=export_db, **options),
+        )
+    finally:
+        export_db.close()
 
 
 def _export_edited_live_without_edited_mov(
@@ -73,20 +119,14 @@ def _export_edited_live_without_edited_mov(
     dest_dir.mkdir()
 
     def export(**kwargs):
-        # each export is a separate run, with the export DB opened afresh
-        export_db = osxphotos.ExportDB(tmp_path / "export.db", dest_dir)
-        options = ExportOptions(
+        return _export(
+            photo,
+            dest_dir,
             edited=True,
             live_photo=True,
-            update=True,
-            export_db=export_db,
             use_photokit=use_photokit,
             **kwargs,
         )
-        try:
-            return PhotoExporter(photo).export(dest_dir, options=options)
-        finally:
-            export_db.close()
 
     # First run: the edited image is exported, the edited video is not
     # (as with an AppleScript download, which cannot produce one)
@@ -106,30 +146,30 @@ def _export_edited_live_without_edited_mov(
 
 @pytest.mark.parametrize("library,uuid", EDITED_LIVE_PHOTOS)
 def test_edited_live_photo_up_to_date_applescript_no_download(
-    monkeypatch, tmp_path, download_calls, library, uuid
+    monkeypatch, tmp_path, download, library, uuid
 ):
     """AppleScript can't export an edited Live Photo's video, so a missing
     <name>_edited.mov must not make the check ask for a download (#12)"""
     results, edited_dest = _export_edited_live_without_edited_mov(
         monkeypatch, tmp_path, library, uuid, use_photokit=False
     )
-    assert download_calls == []
+    assert download.calls == []
     assert results.exported == []
     assert str(edited_dest) in results.skipped
 
 
 @pytest.mark.parametrize("library,uuid", EDITED_LIVE_PHOTOS)
 def test_edited_live_photo_missing_edited_mov_photokit_downloads(
-    monkeypatch, tmp_path, download_calls, library, uuid
+    monkeypatch, tmp_path, download, library, uuid
 ):
     """PhotoKit can export an edited Live Photo's video, so a missing
     <name>_edited.mov still asks for a download"""
     _export_edited_live_without_edited_mov(
         monkeypatch, tmp_path, library, uuid, use_photokit=True
     )
-    assert len(download_calls) == 1
-    assert download_calls[0].use_photokit
-    assert download_calls[0].live_photo
+    assert len(download.calls) == 1
+    assert download.calls[0].use_photokit
+    assert download.calls[0].live_photo
 
 
 # RAW+JPEG pairs (#11). On Photos 7+ these libraries have no RAW type in the
@@ -149,27 +189,23 @@ UUID_RAW_PAIR = "A92D9C26-3A50-4197-9388-CB5F7DB9FA91"
 RAW_PAIRS = [(UUID_MISSING_PAIR, "IMG_2000"), (UUID_RAW_PAIR, "IMG_1994")]
 
 
+@dataclass(frozen=True)
 class RawType:
-    """A RAW format under test: its UTI, and the extension a download stages
-    it under (as Photos writes it: .CR2 in upstream's tests, .raf on the
-    owner's share, e.g. DSCF5860.raf)"""
+    """A RAW format under test: its extension, its UTI, and the extension a
+    download stages it under, whose case comes from Photos (.CR2 for the test
+    libraries' Canon pairs, lower-case .raf for a Fuji pair)"""
 
-    def __init__(self, name: str, uti: str, staged_ext: str):
-        self.name = name
-        self.uti = uti
-        self.staged_ext = staged_ext
-
-    def __repr__(self):
-        return self.name
+    name: str
+    uti: str
+    staged_ext: str
 
 
 CR2 = RawType("cr2", CR2_UTI, "CR2")
 RAF = RawType("raf", RAF_UTI, "raf")
-# ZINTERNALRESOURCE.ZCOMPACTUTI for a Fuji RAF, as in the owner's library
-# (9,311 RAW resources, whose RAW originals have UTI com.fuji.raw-image)
+# ZINTERNALRESOURCE.ZCOMPACTUTI code for a Fuji RAF (com.fuji.raw-image)
 RAF_COMPACT_UTI = 21
-# Pumkins2.jpg, made a RAF-only original in the RAF copies (no JPEG pair): the
-# owner's library has one named DSCF5273.RAF, on the share as DSCF5273.RAF
+# Pumkins2.jpg, made an evicted RAF-only original (no JPEG pair) named
+# DSCF5273.RAF in the RAF copies
 UUID_RAF_ONLY = "D79B8D77-BFFC-460B-9312-034F2877D35B"
 RAF_ONLY_FILENAME = "DSCF5273.RAF"
 
@@ -178,7 +214,7 @@ def _make_raf_library(library: str, dest: pathlib.Path) -> pathlib.Path:
     """Copy a test library and turn its CR2+JPEG pairs into RAF+JPEG pairs
 
     The test libraries have no Fuji photos. In the copy, the RAW resources of
-    IMG_2000 and IMG_1994 get the compact UTI the owner's library has for RAF,
+    IMG_2000 and IMG_1994 get the compact UTI code for RAF,
     IMG_2000's referenced RAW is renamed IMG_2000.RAF, and IMG_1994's RAW in
     originals/ is renamed from _4.cr2 to _4.raf. The checked-in library is
     not modified.
@@ -218,8 +254,8 @@ def _make_raf_library(library: str, dest: pathlib.Path) -> pathlib.Path:
 def _make_raf_only_original(conn):
     """Turn Pumkins2.jpg into an evicted RAF-only original, DSCF5273.RAF
 
-    Shaped on the owner's 3FFD68E9-...: asset UTI com.fuji.raw-image, compact
-    UTI 21 on the original resource, not available locally.
+    As Photos stores one: asset UTI com.fuji.raw-image, compact UTI 21 on the
+    original resource, not available locally.
     """
     (asset_pk,) = conn.execute(
         "SELECT Z_PK FROM ZASSET WHERE ZUUID = ?", (UUID_RAF_ONLY,)
@@ -260,7 +296,9 @@ def raf_libraries(tmp_path_factory):
 
 
 RAW_LIBRARIES = [
-    pytest.param((library, raw_type), id=f"{pathlib.Path(library).stem}-{raw_type}")
+    pytest.param(
+        (library, raw_type), id=f"{pathlib.Path(library).stem}-{raw_type.name}"
+    )
     for raw_type in (CR2, RAF)
     for library in RAW_PAIR_LIBRARIES
 ]
@@ -304,47 +342,18 @@ def evicted_pair(raw_photosdb, monkeypatch):
     return files
 
 
-class FakeDownload:
-    """Stands in for _stage_missing_photos_for_export_helper and records each call
-
-    It stages copies of the given files under the given names, as an AppleScript
-    download does; with no files it stages nothing, as a failed download does.
-    """
-
-    def __init__(self, staging: pathlib.Path | None = None, files=None):
-        self.calls = []
-        self.staging = staging
-        self.files = files or {}
-
-    def __call__(self, exporter, options):
-        self.calls.append(options)
-        staged = StagedFiles()
-        for kind, (src, name) in self.files.items():
-            staged_path = self.staging / name
-            shutil.copy(src, staged_path)
-            setattr(staged, kind, str(staged_path))
-        return staged
-
-
-def _export_raw_pair(photo, dest_dir, monkeypatch, download):
+def _export_raw_pair(photo, dest_dir):
     """Export a RAW+JPEG pair with --update --download-missing"""
-    monkeypatch.setattr(
-        PhotoExporter,
-        "_stage_missing_photos_for_export_helper",
-        lambda self, options: download(self, options),
-    )
-    # each export is a separate run, with the export DB opened afresh
-    export_db = osxphotos.ExportDB(dest_dir.parent / "export.db", dest_dir)
-    options = ExportOptions(
-        update=True,
-        download_missing=True,
-        raw_photo=True,
-        export_db=export_db,
-    )
-    try:
-        return PhotoExporter(photo).export(dest_dir, options=options)
-    finally:
-        export_db.close()
+    return _export(photo, dest_dir, download_missing=True, raw_photo=True)
+
+
+class ExportedPair(NamedTuple):
+    """An evicted RAW+JPEG pair exported once"""
+
+    photo: PhotoInfo
+    dest_dir: pathlib.Path
+    stem: str
+    raw_name: str  # the name of the RAW on the destination
 
 
 def _lower(paths):
@@ -352,74 +361,73 @@ def _lower(paths):
     return sorted(str(path).lower() for path in paths)
 
 
-@pytest.fixture
-def exported_pair(raw_photosdb, raw_type, evicted_pair, monkeypatch, tmp_path, request):
-    """Export an evicted RAW+JPEG pair once, downloading <stem>.JPG and the RAW
-    (<stem>.CR2 or <stem>.raf)
+def _stage_pair(download, evicted_pair, stem, raw_type):
+    """Have the download stage <stem>.JPG and the RAW (<stem>.CR2 or
+    <stem>.raf), with IMG_1994's content; return the RAW's name"""
+    jpeg, raw = evicted_pair
+    raw_name = f"{stem}.{raw_type.staged_ext}"
+    download.stage({"original": (jpeg, f"{stem}.JPG"), "raw": (raw, raw_name)})
+    return raw_name
 
-    The downloaded content is IMG_1994's. Returns the photo, the export
-    directory, the stem and the name of the RAW on the destination.
-    """
+
+@pytest.fixture
+def exported_pair(raw_photosdb, raw_type, evicted_pair, download, tmp_path, request):
+    """Export an evicted RAW+JPEG pair once, downloading <stem>.JPG and the RAW"""
     uuid, stem = request.param
     photo = raw_photosdb.get_photo(uuid)
     assert photo.has_raw and not photo.path and not photo.path_raw
 
     dest_dir = tmp_path / "export"
     dest_dir.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    jpeg, raw = evicted_pair
-    raw_name = f"{stem}.{raw_type.staged_ext}"
-    download = FakeDownload(
-        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, raw_name)}
-    )
-    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    raw_name = _stage_pair(download, evicted_pair, stem, raw_type)
+    first = _export_raw_pair(photo, dest_dir)
     assert len(download.calls) == 1
     assert _lower(first.new) == _lower([dest_dir / f"{stem}.JPG", dest_dir / raw_name])
     # the RAW is written under the staged name, case included
     assert raw_name in [path.name for path in dest_dir.iterdir()]
-    return photo, dest_dir, stem, raw_name
+    download.reset()
+    return ExportedPair(photo, dest_dir, stem, raw_name)
 
 
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
-def test_raw_pair_up_to_date_no_download(exported_pair, monkeypatch):
+def test_raw_pair_up_to_date_no_download(exported_pair, download):
     """An evicted RAW+JPEG pair already exported and unchanged is skipped
     without a download (#11)"""
-    photo, dest_dir, stem, raw_name = exported_pair
-    download = FakeDownload()
-    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    pair = exported_pair
+    results = _export_raw_pair(pair.photo, pair.dest_dir)
     assert download.calls == []
     assert _lower(results.skipped) == _lower(
-        [dest_dir / f"{stem}.JPG", dest_dir / raw_name]
+        [pair.dest_dir / f"{pair.stem}.JPG", pair.dest_dir / pair.raw_name]
     )
     assert results.new == results.updated == results.missing == []
 
 
 @pytest.mark.parametrize("changed", ["JPG", "RAW"])
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
-def test_raw_pair_changed_downloads(exported_pair, monkeypatch, changed):
+def test_raw_pair_changed_downloads(exported_pair, download, changed):
     """An evicted pair whose JPEG or RAW changed on the destination is
     downloaded again; one not yet exported is downloaded by exported_pair"""
-    photo, dest_dir, stem, raw_name = exported_pair
-    changed_name = f"{stem}.JPG" if changed == "JPG" else raw_name
-    (dest_dir / changed_name).write_bytes(b"changed")
-    download = FakeDownload()
-    _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    pair = exported_pair
+    changed_name = f"{pair.stem}.JPG" if changed == "JPG" else pair.raw_name
+    (pair.dest_dir / changed_name).write_bytes(b"changed")
+    _export_raw_pair(pair.photo, pair.dest_dir)
     assert len(download.calls) == 1
     assert download.calls[0].raw_photo
 
 
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
-def test_missing_raw_recorded_with_real_extension(exported_pair, raw_type, monkeypatch):
+def test_missing_raw_recorded_with_real_extension(exported_pair, raw_type, download):
     """A RAW that needs updating but doesn't download is reported missing
     under its real extension (.cr2 or .raf), not .raw"""
-    photo, dest_dir, stem, raw_name = exported_pair
-    (dest_dir / raw_name).write_bytes(b"changed")
-    download = FakeDownload()
-    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    pair = exported_pair
+    (pair.dest_dir / pair.raw_name).write_bytes(b"changed")
+    results = _export_raw_pair(pair.photo, pair.dest_dir)
     assert len(download.calls) == 1
     assert _lower(results.missing) == _lower(
-        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.{raw_type.name}"]
+        [
+            pair.dest_dir / f"{pair.stem}.JPG",
+            pair.dest_dir / f"{pair.stem}.{raw_type.name}",
+        ]
     )
 
 
@@ -441,20 +449,18 @@ def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, raw_type, uuid):
 
 
 def test_raf_pair_exported_and_checked_under_lower_case_raf(
-    raf_libraries, monkeypatch, tmp_path
+    raf_libraries, monkeypatch, download, tmp_path
 ):
     """A RAF+JPEG pair with its RAF on disk is exported as <stem>.raf, lower
-    case as on the owner's share (DSCF5860.raf), and once it is evicted the
-    check looks for that exact name, so it is skipped without a download even
-    on a case-sensitive destination"""
+    case, and once it is evicted the check looks for that exact name, so it is
+    skipped without a download even on a case-sensitive destination"""
     library = raf_libraries("./tests/Test-26.1.photoslibrary")
     photo = osxphotos.PhotosDB(dbfile=str(library)).get_photo(UUID_RAW_PAIR)
     assert photo.path and photo.path_raw.endswith("_4.raf")
     dest_dir = tmp_path / "export"
     dest_dir.mkdir()
 
-    download = FakeDownload()
-    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    first = _export_raw_pair(photo, dest_dir)
     assert download.calls == []
     names = sorted(path.name for path in dest_dir.iterdir())
     assert names == ["IMG_1994.JPG", "IMG_1994.raf"]
@@ -462,15 +468,14 @@ def test_raf_pair_exported_and_checked_under_lower_case_raf(
 
     for attr in ("path", "path_raw"):
         monkeypatch.setattr(PhotoInfo, attr, None)
-    download = FakeDownload()
-    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    results = _export_raw_pair(photo, dest_dir)
     assert download.calls == []
     assert sorted(results.skipped) == [str(dest_dir / name) for name in names]
 
 
 @pytest.mark.parametrize("library", RAW_PAIR_LIBRARIES)
 def test_raf_only_original_checked_under_its_upper_case_name(
-    raf_libraries, monkeypatch, tmp_path, library
+    raf_libraries, download, tmp_path, library
 ):
     """An evicted RAF-only original is exported under its original name,
     DSCF5273.RAF (upper case, unlike a pair's .raf), and once up to date the
@@ -484,18 +489,16 @@ def test_raf_only_original_checked_under_its_upper_case_name(
 
     dest_dir = tmp_path / "export"
     dest_dir.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
     raf_bytes = tmp_path / "raf_bytes"
     raf_bytes.write_bytes(b"FUJIFILMCCD-RAW ")
-    download = FakeDownload(staging, {"original": (raf_bytes, RAF_ONLY_FILENAME)})
-    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    download.stage({"original": (raf_bytes, RAF_ONLY_FILENAME)})
+    first = _export_raw_pair(photo, dest_dir)
     assert len(download.calls) == 1
     assert [path.name for path in dest_dir.iterdir()] == [RAF_ONLY_FILENAME]
     assert first.new == [str(dest_dir / RAF_ONLY_FILENAME)]
 
-    download = FakeDownload()
-    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    download.reset()
+    results = _export_raw_pair(photo, dest_dir)
     assert download.calls == []
     assert results.skipped == [str(dest_dir / RAF_ONLY_FILENAME)]
     assert results.new == results.updated == results.missing == []
@@ -534,27 +537,22 @@ def test_library_compact_uti_codes_match_table(library):
 # --cleanup after an evicted RAW+JPEG pair (#11). Cleanup lives in the CLI: it
 # keeps the files listed as exported, skipped or missing and deletes the rest.
 # While uti_raw was None the RAW was listed under a guessed <stem>.raw, so the
-# real <stem>.raf or .CR2 on the destination was deleted, as DSCF9187.raf was
-# on the owner's share. These run the CLI as the backup does.
+# real <stem>.raf or .CR2 on the destination was deleted. These run the CLI
+# with --exportdb, as a scripted backup would.
 
 
-def _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download):
+def _cli_export_cleanup(photo, dest_dir):
     """Run export --update --download-missing --cleanup --exportdb <db> on one
     photo, as a separate run; return the --report records keyed by lower-case
     file name"""
-    monkeypatch.setattr(
-        PhotoExporter,
-        "_stage_missing_photos_for_export_helper",
-        lambda self, options: download(self, options),
-    )
     report = dest_dir.parent / "report.json"
     result = CliRunner().invoke(
         cli_export,
         [
             "--library",
-            str(library),
+            str(photo._db.library_path),
             "--uuid",
-            uuid,
+            photo.uuid,
             "--update",
             "--download-missing",
             "--cleanup",
@@ -574,62 +572,56 @@ def _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download):
 
 
 @pytest.fixture
-def cli_exported_pair(raw_photosdb, raw_type, evicted_pair, monkeypatch, tmp_path, request):
+def cli_exported_pair(
+    raw_photosdb, raw_type, evicted_pair, download, tmp_path, request
+):
     """Export an evicted RAW+JPEG pair once through the CLI, downloading
-    <stem>.JPG and the RAW (<stem>.CR2 or <stem>.raf; IMG_1994's content)
-
-    Returns the library, uuid, export directory, stem and the RAW's name.
-    """
+    <stem>.JPG and the RAW"""
     uuid, stem = request.param
-    library = raw_photosdb.library_path
+    photo = raw_photosdb.get_photo(uuid)
     dest_dir = tmp_path / "export"
     dest_dir.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    jpeg, raw = evicted_pair
-    raw_name = f"{stem}.{raw_type.staged_ext}"
-    download = FakeDownload(
-        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, raw_name)}
-    )
-    _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
+    raw_name = _stage_pair(download, evicted_pair, stem, raw_type)
+    _cli_export_cleanup(photo, dest_dir)
     assert len(download.calls) == 1
     assert sorted(path.name for path in dest_dir.iterdir()) == sorted(
         [f"{stem}.JPG", raw_name]
     )
-    return library, uuid, dest_dir, stem, raw_name
+    download.reset()
+    return ExportedPair(photo, dest_dir, stem, raw_name)
 
 
 @pytest.mark.parametrize("cli_exported_pair", RAW_PAIRS, indirect=True)
-def test_cleanup_keeps_up_to_date_evicted_raw_pair(cli_exported_pair, monkeypatch):
+def test_cleanup_keeps_up_to_date_evicted_raw_pair(cli_exported_pair, download):
     """--cleanup keeps both files of an evicted RAW+JPEG pair that is up to
     date: the pair is skipped, with no download"""
-    library, uuid, dest_dir, stem, raw_name = cli_exported_pair
-    before = {path.name: path.read_bytes() for path in dest_dir.iterdir()}
-    download = FakeDownload()
-    records = _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
-    assert {path.name: path.read_bytes() for path in dest_dir.iterdir()} == before
+    pair = cli_exported_pair
+    before = {path.name: path.read_bytes() for path in pair.dest_dir.iterdir()}
+    records = _cli_export_cleanup(pair.photo, pair.dest_dir)
+    after = {path.name: path.read_bytes() for path in pair.dest_dir.iterdir()}
+    assert after == before
     assert not any(r["cleanup_deleted_file"] for r in records.values())
     assert download.calls == []
-    assert records[f"{stem}.jpg".lower()]["skipped"]
-    assert records[raw_name.lower()]["skipped"]
+    assert records[f"{pair.stem}.jpg".lower()]["skipped"]
+    assert records[pair.raw_name.lower()]["skipped"]
 
 
 @pytest.mark.parametrize("changed", ["JPG", "RAW"])
 @pytest.mark.parametrize("cli_exported_pair", RAW_PAIRS, indirect=True)
 def test_cleanup_keeps_raw_of_evicted_pair_recorded_missing(
-    cli_exported_pair, raw_type, monkeypatch, changed
+    cli_exported_pair, raw_type, download, changed
 ):
     """--cleanup keeps the RAW of an evicted pair whose download returns
     nothing: the pair is recorded missing under the RAW's real extension
     (.cr2 or .raf), so the file already on the destination is kept"""
-    library, uuid, dest_dir, stem, raw_name = cli_exported_pair
-    changed_name = f"{stem}.JPG" if changed == "JPG" else raw_name
-    (dest_dir / changed_name).write_bytes(b"changed")
-    before = {path.name: path.read_bytes() for path in dest_dir.iterdir()}
-    download = FakeDownload()
-    records = _cli_export_cleanup(library, uuid, dest_dir, monkeypatch, download)
-    assert {path.name: path.read_bytes() for path in dest_dir.iterdir()} == before
+    pair = cli_exported_pair
+    changed_name = f"{pair.stem}.JPG" if changed == "JPG" else pair.raw_name
+    (pair.dest_dir / changed_name).write_bytes(b"changed")
+    before = {path.name: path.read_bytes() for path in pair.dest_dir.iterdir()}
+    records = _cli_export_cleanup(pair.photo, pair.dest_dir)
+    after = {path.name: path.read_bytes() for path in pair.dest_dir.iterdir()}
+    assert after == before
     assert not any(r["cleanup_deleted_file"] for r in records.values())
     assert len(download.calls) == 1
     missing = sorted(name for name, r in records.items() if r["missing"])
-    assert missing == _lower([f"{stem}.jpg", f"{stem}.{raw_type.name}"])
+    assert missing == _lower([f"{pair.stem}.jpg", f"{pair.stem}.{raw_type.name}"])
