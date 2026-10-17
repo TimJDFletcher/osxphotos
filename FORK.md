@@ -45,6 +45,8 @@ These modules cover `photoexporter.py`, `--update`, `--download-missing` and the
 
 A test that would reach Photos therefore fails instead of touching `~/Pictures/Photos Library.photoslibrary`. Nothing tripped it in the run above.
 
+`--linux-stat-cache` also makes `DirectoryStatCache` match names exactly, its default off macOS. Upstream's CI runs Ubuntu as well as macOS, and a test that relies on macOS's case-insensitive matching passes here but fails there: #2265's first CI run failed this way. With the option, the pre-fix test module fails the same 6 tests here.
+
 Leave these out. They need the Photos app or the system library:
 
 - `tests/test_photoexporter_kill_photos.py`: launches and kills Photos.app.
@@ -83,6 +85,20 @@ The fixes go upstream as two PRs, one per fix: they touch different code and nei
 | RAW type from the Photos database (#11, incl. `--cleanup`) | `upstream/raw-type-from-db` | `osxphotos/photoinfo.py`, `osxphotos/photosdb/photosdb.py`, `osxphotos/photosdb/photosdb_utils.py`, `tests/test-Test-26.1.json`, `tests/test_photoexporter_needs_download_raw.py`, its two `CHANGELOG.md` lines |
 
 Leave out `fork/` and this file. The tests don't need `fork/no_photos.py`; it only guards runs here.
+
+They are open as RhetTbull/osxphotos [#2265](https://github.com/RhetTbull/osxphotos/pull/2265) (RAW) and [#2266](https://github.com/RhetTbull/osxphotos/pull/2266) (edited Live Photo). Before pushing to either branch, run the whole suite on Linux too, as upstream's Ubuntu job does. Apple's `container` runs it in a Linux VM in about 2 minutes:
+
+```bash
+container system start
+git archive <branch> | tar -x -C <empty dir>
+container run --rm -c 6 -m 8G -v <dir>:/src ghcr.io/astral-sh/uv:python3.14-bookworm bash -c \
+  'apt-get update -qq && apt-get install -y -qq libimage-exiftool-perl >/dev/null &&
+   cp -a /src /work && cd /work && uv venv -q && uv pip install -q -e ".[dev]" &&
+   .venv/bin/python -m pytest -q tests/'
+container system stop
+```
+
+A push to a PR branch waits for a maintainer to approve its CI run ("action_required"), so the Linux run is the check until then. After a rebase, check the local branch matches `origin/` before working on it.
 
 Notes to put in the PRs (no code change for these):
 
