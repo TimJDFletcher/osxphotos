@@ -458,6 +458,85 @@ def test_library_compact_uti_codes_match_table(library):
         assert COMPACT_UTI_CODES.get(code, uti) == uti
 
 
+# A RAW's compact UTI code that isn't in COMPACT_UTI_CODES is learned from the
+# library: from original resources with that code, or from RAWs with that code
+# whose file is on disk. ARW_COMPACT_UTI stands for a code the table doesn't have.
+ARW_COMPACT_UTI = 99
+ARW_UTI = "com.sony.arw-raw-image"
+FALLBACK_LIBRARY = "./tests/Test-26.1.photoslibrary"
+
+
+def _make_library_with_raw_code(dest, uuids, code, rename_raw_to=None):
+    """Copy FALLBACK_LIBRARY and give the RAW resources of the pairs in uuids
+    the compact UTI code; with rename_raw_to, rename IMG_1994's RAW in
+    originals/ from _4.cr2 to that extension. Returns the copy's path."""
+    copy = dest / pathlib.Path(FALLBACK_LIBRARY).name
+    shutil.copytree(FALLBACK_LIBRARY, copy)
+    conn = sqlite3.connect(copy / "database" / "Photos.sqlite")
+    try:
+        placeholders = ", ".join("?" for _ in uuids)
+        cur = conn.execute(
+            f""" UPDATE ZINTERNALRESOURCE SET ZCOMPACTUTI = ? WHERE Z_PK IN (
+            SELECT ZINTERNALRESOURCE.Z_PK FROM ZINTERNALRESOURCE
+            JOIN ZASSET ON ZASSET.Z_PK = ZINTERNALRESOURCE.ZASSET
+            WHERE ZINTERNALRESOURCE.ZDATASTORESUBTYPE = 17
+            AND ZASSET.ZUUID IN ({placeholders}))""",
+            (code, *uuids),
+        )
+        assert cur.rowcount == len(uuids)
+        conn.commit()
+    finally:
+        conn.close()
+    if rename_raw_to:
+        (raw_cr2,) = (copy / "originals").glob(f"*/{UUID_RAW_PAIR}_4.cr2")
+        raw_cr2.rename(raw_cr2.with_suffix(f".{rename_raw_to}"))
+    return copy
+
+
+def test_unknown_raw_code_learned_from_raw_on_disk(tmp_path):
+    """An evicted pair's RAW with a code not in the table gets the type of
+    another pair's RAW on disk with the same code"""
+    library = _make_library_with_raw_code(
+        tmp_path, [UUID_MISSING_PAIR, UUID_RAW_PAIR], ARW_COMPACT_UTI, "arw"
+    )
+    photosdb = osxphotos.PhotosDB(dbfile=str(library))
+    on_disk = photosdb.get_photo(UUID_RAW_PAIR)
+    assert on_disk.path_raw.endswith("_4.arw")
+    evicted = photosdb.get_photo(UUID_MISSING_PAIR)
+    assert evicted.path_raw is None
+    assert evicted.uti_raw == ARW_UTI
+
+
+def test_unknown_raw_code_without_a_source_stays_unknown(tmp_path, download):
+    """With no RAW on disk or original with the same code, an unknown code
+    leaves uti_raw None, and the RAW is still recorded missing as .raw"""
+    library = _make_library_with_raw_code(
+        tmp_path, [UUID_MISSING_PAIR], ARW_COMPACT_UTI
+    )
+    photo = osxphotos.PhotosDB(dbfile=str(library)).get_photo(UUID_MISSING_PAIR)
+    assert photo.path_raw is None
+    assert photo.uti_raw is None
+
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+    results = _export_raw_pair(photo, dest_dir)
+    assert len(download.calls) == 1
+    assert _lower(results.missing) == _lower(
+        [dest_dir / "IMG_2000.JPG", dest_dir / "IMG_2000.raw"]
+    )
+
+
+def test_known_raw_code_wins_over_raw_on_disk(tmp_path):
+    """A code in the table keeps its UTI even when a RAW on disk with that
+    code has another type's extension"""
+    library = _make_library_with_raw_code(
+        tmp_path, [UUID_MISSING_PAIR, UUID_RAW_PAIR], 11, "arw"
+    )
+    photosdb = osxphotos.PhotosDB(dbfile=str(library))
+    assert photosdb.get_photo(UUID_RAW_PAIR).uti_raw == ARW_UTI  # from its file
+    assert photosdb.get_photo(UUID_MISSING_PAIR).uti_raw == CR2_UTI
+
+
 # --cleanup after an evicted RAW+JPEG pair (#11). Cleanup lives in the CLI: it
 # keeps the files listed as exported, skipped or missing and deletes the rest.
 # While uti_raw was None the RAW was listed under a guessed <stem>.raw, so the
