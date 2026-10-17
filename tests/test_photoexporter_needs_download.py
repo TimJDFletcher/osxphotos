@@ -137,6 +137,7 @@ RAW_PAIR_LIBRARIES = [
     "./tests/Test-26.1.photoslibrary",
 ]
 CR2_UTI = "com.canon.cr2-raw-image"
+RAF_UTI = "com.fuji.raw-image"
 # IMG_2000.JPG: a pair not copied into the library, missing: path_raw is None
 UUID_MISSING_PAIR = "8E1D7BC9-9321-44F9-8CFB-4083F6B9232A"
 # IMG_1994.JPG: a pair stored in the library with its CR2 on disk
@@ -144,16 +145,111 @@ UUID_RAW_PAIR = "A92D9C26-3A50-4197-9388-CB5F7DB9FA91"
 RAW_PAIRS = [(UUID_MISSING_PAIR, "IMG_2000"), (UUID_RAW_PAIR, "IMG_1994")]
 
 
-@pytest.fixture(scope="module", params=RAW_PAIR_LIBRARIES)
-def raw_photosdb(request):
-    return osxphotos.PhotosDB(dbfile=request.param)
+class RawType:
+    """A RAW format under test: its UTI, and the extension a download stages
+    it under (as Photos writes it: .CR2 in upstream's tests, .raf on the
+    owner's share, e.g. DSCF5860.raf)"""
+
+    def __init__(self, name: str, uti: str, staged_ext: str):
+        self.name = name
+        self.uti = uti
+        self.staged_ext = staged_ext
+
+    def __repr__(self):
+        return self.name
+
+
+CR2 = RawType("cr2", CR2_UTI, "CR2")
+RAF = RawType("raf", RAF_UTI, "raf")
+# ZINTERNALRESOURCE.ZCOMPACTUTI for a Fuji RAF, as in the owner's library
+# (9,311 RAW resources, whose RAW originals have UTI com.fuji.raw-image)
+RAF_COMPACT_UTI = 21
+
+
+def _make_raf_library(library: str, dest: pathlib.Path) -> pathlib.Path:
+    """Copy a test library and turn its CR2+JPEG pairs into RAF+JPEG pairs
+
+    The test libraries have no Fuji photos. In the copy, the RAW resources of
+    IMG_2000 and IMG_1994 get the compact UTI the owner's library has for RAF,
+    IMG_2000's referenced RAW is renamed IMG_2000.RAF, and IMG_1994's RAW in
+    originals/ is renamed from _4.cr2 to _4.raf. The checked-in library is
+    not modified.
+    """
+    copy = dest / pathlib.Path(library).name
+    shutil.copytree(library, copy)
+    conn = sqlite3.connect(copy / "database" / "Photos.sqlite")
+    try:
+        uuids = (UUID_MISSING_PAIR, UUID_RAW_PAIR)
+        raw_resources = """ SELECT ZINTERNALRESOURCE.Z_PK FROM ZINTERNALRESOURCE
+            JOIN ZASSET ON ZASSET.Z_PK = ZINTERNALRESOURCE.ZASSET
+            WHERE ZINTERNALRESOURCE.ZDATASTORESUBTYPE = 17 AND ZASSET.ZUUID IN (?, ?)
+        """
+        cur = conn.execute(
+            f"UPDATE ZINTERNALRESOURCE SET ZCOMPACTUTI = ? WHERE Z_PK IN ({raw_resources})",
+            (RAF_COMPACT_UTI, *uuids),
+        )
+        assert cur.rowcount == 2
+        cur = conn.execute(
+            f""" UPDATE ZFILESYSTEMBOOKMARK
+            SET ZPATHRELATIVETOVOLUME = replace(ZPATHRELATIVETOVOLUME, '.CR2', '.RAF')
+            WHERE ZRESOURCE IN ({raw_resources})""",
+            uuids,
+        )
+        assert cur.rowcount == 1  # IMG_2000, a referenced file
+        conn.commit()
+    finally:
+        conn.close()
+    (raw_cr2,) = (copy / "originals").glob(f"*/{UUID_RAW_PAIR}_4.cr2")
+    raw_cr2.rename(raw_cr2.with_suffix(".raf"))
+    return copy
+
+
+@pytest.fixture(scope="module")
+def raf_libraries(tmp_path_factory):
+    """RAF copies of the test libraries, made when first asked for"""
+    copies = {}
+
+    def get(library):
+        if library not in copies:
+            copies[library] = _make_raf_library(
+                library, tmp_path_factory.mktemp("raf_library")
+            )
+        return copies[library]
+
+    return get
+
+
+RAW_LIBRARIES = [
+    pytest.param((library, raw_type), id=f"{pathlib.Path(library).stem}-{raw_type}")
+    for raw_type in (CR2, RAF)
+    for library in RAW_PAIR_LIBRARIES
+]
+
+
+@pytest.fixture(scope="module", params=RAW_LIBRARIES)
+def raw_library(request, raf_libraries):
+    """(PhotosDB, RawType): a test library as it is (CR2 pairs), or its RAF copy"""
+    library, raw_type = request.param
+    if raw_type is RAF:
+        library = raf_libraries(library)
+    return osxphotos.PhotosDB(dbfile=str(library)), raw_type
+
+
+@pytest.fixture
+def raw_photosdb(raw_library):
+    return raw_library[0]
+
+
+@pytest.fixture
+def raw_type(raw_library):
+    return raw_library[1]
 
 
 @pytest.fixture
 def evicted_pair(raw_photosdb, monkeypatch):
     """Make IMG_1994 look evicted to iCloud: neither its JPEG nor its RAW is on disk
 
-    Returns the paths of IMG_1994's JPEG and CR2 in the library, read beforehand.
+    Returns the paths of IMG_1994's JPEG and RAW in the library, read beforehand.
     """
     present = raw_photosdb.get_photo(UUID_RAW_PAIR)
     files = (present.path, present.path_raw)
@@ -217,11 +313,12 @@ def _lower(paths):
 
 
 @pytest.fixture
-def exported_pair(raw_photosdb, evicted_pair, monkeypatch, tmp_path, request):
-    """Export an evicted RAW+JPEG pair once, downloading <stem>.JPG and <stem>.CR2
+def exported_pair(raw_photosdb, raw_type, evicted_pair, monkeypatch, tmp_path, request):
+    """Export an evicted RAW+JPEG pair once, downloading <stem>.JPG and the RAW
+    (<stem>.CR2 or <stem>.raf)
 
     The downloaded content is IMG_1994's. Returns the photo, the export
-    directory and the stem.
+    directory, the stem and the name of the RAW on the destination.
     """
     uuid, stem = request.param
     photo = raw_photosdb.get_photo(uuid)
@@ -232,38 +329,40 @@ def exported_pair(raw_photosdb, evicted_pair, monkeypatch, tmp_path, request):
     staging = tmp_path / "staging"
     staging.mkdir()
     jpeg, raw = evicted_pair
+    raw_name = f"{stem}.{raw_type.staged_ext}"
     download = FakeDownload(
-        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, f"{stem}.CR2")}
+        staging, {"original": (jpeg, f"{stem}.JPG"), "raw": (raw, raw_name)}
     )
     first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
     assert len(download.calls) == 1
-    assert _lower(first.new) == _lower(
-        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
-    )
-    return photo, dest_dir, stem
+    assert _lower(first.new) == _lower([dest_dir / f"{stem}.JPG", dest_dir / raw_name])
+    # the RAW is written under the staged name, case included
+    assert raw_name in [path.name for path in dest_dir.iterdir()]
+    return photo, dest_dir, stem, raw_name
 
 
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
 def test_raw_pair_up_to_date_no_download(exported_pair, monkeypatch):
     """An evicted RAW+JPEG pair already exported and unchanged is skipped
     without a download (#11)"""
-    photo, dest_dir, stem = exported_pair
+    photo, dest_dir, stem, raw_name = exported_pair
     download = FakeDownload()
     results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
     assert download.calls == []
     assert _lower(results.skipped) == _lower(
-        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
+        [dest_dir / f"{stem}.JPG", dest_dir / raw_name]
     )
     assert results.new == results.updated == results.missing == []
 
 
-@pytest.mark.parametrize("changed", ["JPG", "CR2"])
+@pytest.mark.parametrize("changed", ["JPG", "RAW"])
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
 def test_raw_pair_changed_downloads(exported_pair, monkeypatch, changed):
     """An evicted pair whose JPEG or RAW changed on the destination is
     downloaded again; one not yet exported is downloaded by exported_pair"""
-    photo, dest_dir, stem = exported_pair
-    (dest_dir / f"{stem}.{changed}").write_bytes(b"changed")
+    photo, dest_dir, stem, raw_name = exported_pair
+    changed_name = f"{stem}.JPG" if changed == "JPG" else raw_name
+    (dest_dir / changed_name).write_bytes(b"changed")
     download = FakeDownload()
     _export_raw_pair(photo, dest_dir, monkeypatch, download)
     assert len(download.calls) == 1
@@ -271,33 +370,64 @@ def test_raw_pair_changed_downloads(exported_pair, monkeypatch, changed):
 
 
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
-def test_missing_raw_recorded_with_real_extension(exported_pair, monkeypatch):
-    """A RAW that needs updating but doesn't download is reported missing as
-    .CR2, not .raw"""
-    photo, dest_dir, stem = exported_pair
-    (dest_dir / f"{stem}.CR2").write_bytes(b"changed")
+def test_missing_raw_recorded_with_real_extension(
+    exported_pair, raw_type, monkeypatch
+):
+    """A RAW that needs updating but doesn't download is reported missing
+    under its real extension (.cr2 or .raf), not .raw"""
+    photo, dest_dir, stem, raw_name = exported_pair
+    (dest_dir / raw_name).write_bytes(b"changed")
     download = FakeDownload()
     results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
     assert len(download.calls) == 1
     assert _lower(results.missing) == _lower(
-        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.CR2"]
+        [dest_dir / f"{stem}.JPG", dest_dir / f"{stem}.{raw_type.name}"]
     )
 
 
 @pytest.mark.parametrize("uuid", [UUID_MISSING_PAIR, UUID_RAW_PAIR])
-def test_uti_raw_without_raw_on_disk(raw_photosdb, evicted_pair, uuid):
+def test_uti_raw_without_raw_on_disk(raw_photosdb, raw_type, evicted_pair, uuid):
     """uti_raw comes from the Photos database when the RAW isn't on disk"""
     photo = raw_photosdb.get_photo(uuid)
     assert photo.path_raw is None
-    assert photo.uti_raw == CR2_UTI
+    assert photo.uti_raw == raw_type.uti
 
 
 @pytest.mark.parametrize("uuid", [UUID_MISSING_PAIR, UUID_RAW_PAIR])
-def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, uuid):
+def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, raw_type, uuid):
     """uti_raw still comes from the RAW file when it is on disk"""
     photo = raw_photosdb.get_photo(uuid)
     if photo.path_raw:
-        assert photo.uti_raw == CR2_UTI
+        assert pathlib.Path(photo.path_raw).suffix == f".{raw_type.name}"
+        assert photo.uti_raw == raw_type.uti
+
+
+def test_raf_pair_exported_and_checked_under_lower_case_raf(
+    raf_libraries, monkeypatch, tmp_path
+):
+    """A RAF+JPEG pair with its RAF on disk is exported as <stem>.raf, lower
+    case as on the owner's share (DSCF5860.raf), and once it is evicted the
+    check looks for that exact name, so it is skipped without a download even
+    on a case-sensitive destination"""
+    library = raf_libraries("./tests/Test-26.1.photoslibrary")
+    photo = osxphotos.PhotosDB(dbfile=str(library)).get_photo(UUID_RAW_PAIR)
+    assert photo.path and photo.path_raw.endswith("_4.raf")
+    dest_dir = tmp_path / "export"
+    dest_dir.mkdir()
+
+    download = FakeDownload()
+    first = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert download.calls == []
+    names = sorted(path.name for path in dest_dir.iterdir())
+    assert names == ["IMG_1994.JPG", "IMG_1994.raf"]
+    assert sorted(first.new) == [str(dest_dir / name) for name in names]
+
+    for attr in ("path", "path_raw"):
+        monkeypatch.setattr(PhotoInfo, attr, None)
+    download = FakeDownload()
+    results = _export_raw_pair(photo, dest_dir, monkeypatch, download)
+    assert download.calls == []
+    assert sorted(results.skipped) == [str(dest_dir / name) for name in names]
 
 
 @pytest.mark.parametrize(
@@ -305,7 +435,7 @@ def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, uuid):
     [
         ("11", None, CR2_UTI),
         (11, None, CR2_UTI),
-        ("21", None, "com.fuji.raw-image"),
+        ("21", None, RAF_UTI),
         ("_org.webmproject.webp", None, "org.webmproject.webp"),
         ("99", None, None),
         ("99", {"99": "com.sony.arw-raw-image"}, "com.sony.arw-raw-image"),
