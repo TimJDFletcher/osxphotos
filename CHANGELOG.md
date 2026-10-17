@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
 
 #### Fixed
 
+- Fixed `export --update --download-missing` downloading RAW+JPEG pairs whose RAW is in iCloud on every run, on Photos 7+. `PhotoInfo.uti_raw` came from the RAW file on disk, so it was `None` while the RAW was evicted and the update check looked for `<name>.raw` on the destination; the RAW's type is now read from the Photos database when the file isn't on disk.
+- Fixed `export --update --download-missing --cleanup` deleting the RAW of a RAW+JPEG pair whose RAW is in iCloud: the RAW was recorded as missing under `<name>.raw` instead of its real extension, so cleanup removed the exported RAW.
+
 #### Contributors
 
 ## [v0.77.2](https://github.com/RhetTbull/osxphotos/compare/v0.77.1...v0.77.2)
