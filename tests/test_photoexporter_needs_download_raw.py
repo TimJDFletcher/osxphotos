@@ -360,13 +360,11 @@ def test_uti_raw_without_raw_on_disk(raw_photosdb, raw_type, evicted_pair, uuid)
     assert photo.uti_raw == raw_type.uti
 
 
-@pytest.mark.parametrize("uuid", [UUID_MISSING_PAIR, UUID_RAW_PAIR])
-def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, raw_type, uuid):
+def test_uti_raw_with_raw_on_disk_unchanged(raw_photosdb, raw_type):
     """uti_raw still comes from the RAW file when it is on disk"""
-    photo = raw_photosdb.get_photo(uuid)
-    if photo.path_raw:
-        assert pathlib.Path(photo.path_raw).suffix == f".{raw_type.name}"
-        assert photo.uti_raw == raw_type.uti
+    photo = raw_photosdb.get_photo(UUID_RAW_PAIR)
+    assert pathlib.Path(photo.path_raw).suffix == f".{raw_type.name}"
+    assert photo.uti_raw == raw_type.uti
 
 
 def test_raf_pair_exported_and_checked_under_lower_case_raf(
