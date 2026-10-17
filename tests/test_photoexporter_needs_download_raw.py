@@ -1,4 +1,4 @@
-"""Tests for evicted RAW+JPEG pairs in export --update --download-missing (#11)
+"""Tests for evicted RAW+JPEG pairs in export --update --download-missing
 
 On Photos 7+, PhotoInfo.uti_raw came only from the RAW file on disk, so it was
 None while the RAW was evicted to iCloud. The pre-download check
@@ -102,7 +102,7 @@ def _export(photo, dest_dir, case_sensitive=False, **options):
         export_db.close()
 
 
-# RAW+JPEG pairs (#11). On Photos 7+ these libraries have no RAW type in the
+# RAW+JPEG pairs. On Photos 7+ these libraries have no RAW type in the
 # column osxphotos reads for Photos 5 and 6, and uti_raw came from the RAW file
 # on disk, so it was None while the RAW was evicted.
 RAW_PAIR_LIBRARIES = [
@@ -328,7 +328,7 @@ def exported_pair(raw_photosdb, raw_type, evicted_pair, download, tmp_path, requ
 @pytest.mark.parametrize("exported_pair", RAW_PAIRS, indirect=True)
 def test_raw_pair_up_to_date_no_download(exported_pair, download):
     """An evicted RAW+JPEG pair already exported and unchanged is skipped
-    without a download (#11)"""
+    without a download"""
     pair = exported_pair
     results = _export_raw_pair(pair.photo, pair.dest_dir)
     assert download.calls == []
@@ -619,7 +619,7 @@ def test_known_raw_code_wins_over_raw_on_disk(tmp_path):
     assert photosdb.get_photo(UUID_MISSING_PAIR).uti_raw == CR2_UTI
 
 
-# --cleanup after an evicted RAW+JPEG pair (#11). Cleanup lives in the CLI: it
+# --cleanup after an evicted RAW+JPEG pair. Cleanup lives in the CLI: it
 # keeps the files listed as exported, skipped or missing and deletes the rest.
 # While uti_raw was None the RAW was listed under a guessed <stem>.raw, so the
 # real <stem>.raf or .CR2 on the destination was deleted. These run the CLI

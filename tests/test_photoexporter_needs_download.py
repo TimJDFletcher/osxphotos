@@ -108,7 +108,7 @@ def test_edited_live_photo_up_to_date_applescript_no_download(
     monkeypatch, tmp_path, download_calls, library, uuid
 ):
     """AppleScript can't export an edited Live Photo's video, so a missing
-    <name>_edited.mov must not make the check ask for a download (#12)"""
+    <name>_edited.mov must not make the check ask for a download"""
     results, edited_dest = _export_edited_live_without_edited_mov(
         monkeypatch, tmp_path, library, uuid, use_photokit=False
     )
