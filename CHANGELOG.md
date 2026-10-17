@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 
 - Fixed `export --update --download-missing` downloading RAW+JPEG pairs whose RAW is in iCloud on every run, on Photos 7+. `PhotoInfo.uti_raw` came from the RAW file on disk, so it was `None` while the RAW was evicted and the update check looked for `<name>.raw` on the destination; the RAW's type is now read from the Photos database when the file isn't on disk.
 - Fixed `export --update --download-missing --cleanup` deleting the RAW of a RAW+JPEG pair whose RAW is in iCloud: the RAW was recorded as missing under `<name>.raw` instead of its real extension, so cleanup removed the exported RAW.
+- Fixed `export --update --download-missing` downloading an edited Live Photo on every run when downloading with AppleScript. The update check required `<name>_edited.mov` on the destination, which AppleScript can't export; it is now only required with `--use-photokit`.
 
 #### Contributors
 
